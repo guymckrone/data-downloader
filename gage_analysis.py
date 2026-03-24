@@ -1,4 +1,4 @@
-import logging
+
 from datetime import datetime
 import os
 import sqlite3
@@ -8,14 +8,12 @@ import numpy as np
 
 # Import shared configuration
 from config import OUTPUT_DIR, START_DATE, END_DATE
+# from data_loader import find_latest_database, load_rainfall_data,
+from logging_setup import setup_logging, get_logger
 
 # Set up logging
-logging.basicConfig(
-    level = logging.DEBUG,
-    format = "%(asctime)s - %(levelname)s - %(message)s",
-    datefmt = "%H:%M:%S"
-)
-logger = logging.getLogger(__name__)
+setup_logging()
+logger = get_logger(__name__)
 
 
 def find_latest_database(output_dir):
