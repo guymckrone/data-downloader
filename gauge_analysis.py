@@ -6,7 +6,7 @@ import numpy as np
 
 # Import shared configuration
 from config import OUTPUT_DIR, START_DATE, END_DATE
-from data_loader import find_latest_database, load_database_to_dataframe, _load_from_database
+from data_loader import find_latest_database, load_database_to_dataframe, filter_by_date
 from logging_setup import setup_logging, get_logger
 
 # Set up logging
@@ -296,9 +296,7 @@ def main():
     rain_df = load_database_to_dataframe(db_path)
 
     # Limit dates
-    if START_DATE and END_DATE:
-        rain_df = rain_df.loc[START_DATE:END_DATE]
-        logger.info(f"Filtered to {START_DATE} to {END_DATE}: {len(rain_df):,} timestamps")
+    rain_df = filter_by_date(rain_df, START_DATE, END_DATE)
 
     # Check true missingness
     # investigate_true_missingness(rain_df)
