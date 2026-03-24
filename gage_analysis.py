@@ -8,7 +8,7 @@ import numpy as np
 
 # Import shared configuration
 from config import OUTPUT_DIR, START_DATE, END_DATE
-# from data_loader import find_latest_database, load_rainfall_data,
+from data_loader import find_latest_database, load_database_to_dataframe, _load_from_database
 from logging_setup import setup_logging, get_logger
 
 # Set up logging
@@ -16,7 +16,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def find_latest_database(output_dir):
+def find_latest_database2(output_dir):
     logger.info(f"Looking for database files in {output_dir}...")
 
     # Get all files in the directory
@@ -45,7 +45,7 @@ def find_latest_database(output_dir):
 
     return db_path
 
-def load_database_to_dataframe(db_path):
+def load_database_to_dataframe2(db_path):
     logger.info("Loading data from database")
     
     df = _load_from_database(db_path)
@@ -67,7 +67,7 @@ def load_database_to_dataframe(db_path):
 
     return wide
 
-def _load_from_database(db_path):
+def _load_from_database2(db_path):
     # Connect to database
     with sqlite3.connect(db_path) as conn:
         # Read data into dataframe
