@@ -36,7 +36,7 @@ def find_latest_database(output_dir):
 
     return db_path
 
-def load_database_to_dataframe(db_path):
+def load_rainfall_data(db_path):
     logger.info("Loading data from database")
     
     df = _load_from_database(db_path)
@@ -74,3 +74,9 @@ def _load_from_database(db_path):
     df['timestamp'] = pd.to_datetime(df['timestamp'])
 
     return df
+
+def filter_by_date(rain_df, start_date, end_date):
+    if start_date and end_date:
+        rain_df = rain_df.loc[start_date:end_date]
+        logger.info(f"Filtered to {start_date} to {end_date}: {len(rain_df):,} timestamps")
+    return rain_df
