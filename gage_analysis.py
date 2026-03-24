@@ -150,9 +150,9 @@ def analyze_gage_coobservation(rain_df, gage_name):
 
     # Calc percentiles
     if len(all_other_rainfall) > 0:
-        percentiles = all_other_rainfall.quantile([0.05, 0.25, 0.50, 0.75, 0.95])
+        percentiles = all_other_rainfall.quantile([0.05, 0.25, 0.50, 0.75, 0.95, 0.99, 1])
     else:
-        percentiles = pd.Series([np.nan] * 5, index = [0.05, 0.25, 0.50, 0.75, 0.95])
+        percentiles = pd.Series([np.nan] * 5, index = [0.05, 0.25, 0.50, 0.75, 0.95, 0.99, 1])
 
     return {
         'gage': gage_name,
@@ -164,6 +164,8 @@ def analyze_gage_coobservation(rain_df, gage_name):
         'other_rain_50th': round(percentiles[0.50], 4),
         'other_rain_75th': round(percentiles[0.75], 4),
         'other_rain_95th': round(percentiles[0.95], 4),
+        'other_rain_99th': round(percentiles[0.99], 4),
+        'other_rain_max': round(percentiles[1], 4),
         'n_coobservations': len(all_other_rainfall)
     }
 
