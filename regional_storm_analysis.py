@@ -1,6 +1,8 @@
 from config import OUTPUT_DIR, START_DATE, END_DATE
 from logging_setup import setup_logging, get_logger
 from data_loader import find_latest_database, load_rainfall_data, filter_by_date
+import numpy as np
+import pandas as pd
 
 setup_logging()
 logger = get_logger(__name__)
@@ -58,7 +60,7 @@ def calculate_interevent_periods(rain_df, interevent_hours=6):
 
     # Figre out time between rows
     time_diff = rain_df.index[1] - rain_df.index[0]
-    minutes_per_step = time_diff.total_seconds() / 60
+    minutes_per_step = time_diff.total_seconds() / 60 # Get seconds as plain number from date time object
     steps_per_hour = 60 / minutes_per_step
     interevent_steps = int(interevent_hours * steps_per_hour)
 
@@ -71,12 +73,69 @@ def apply_interevent_window(network_is_wet, interevent_steps):
 
     in_storm = (
         network_is_wet
-        .rolling(window=interevent_steps, min_periods=1)
-        .max()
-        .astype(bool)   
+        .rolling(window=interevent_steps, min_periods=1) # Uses the interevent window to calculate if we are still in a storm, min periods allows for it to work at the beginning
+        .max() # FOr each window find the max value, for if it is > 0 it rained in the period
+        .astype(bool) # Converts back to bool
     )
 
     return in_storm
+
+def find_storm_starts(in_storm):
+    as_integer = in_storm.astype(int) # Converts to int
+
+    differences = as_integer.diff() # Calcs difference from previous row
+
+    storm_starts = (differences == 1) # Finds where diff == 1 which is where a storm starts
+
+    return storm_starts
+
+def assign_storm_numbers(in_storm, storm_starts):
+    cumulative_storms = storm_starts.cumsum() # Cumulative sum of storm starts
+
+    storm_numbers = np.where(
+        in_storm, # Condition: In storm
+        cumulative_storms, # If true, use the storm number
+        0 # If false use 0
+    )
+
+    storm_series = pd.Series(
+        storm_numbers,          # The data, storm numbers
+        index = in_storm.index, # The index, the timestamps
+        name = 'storm'          # Column name
+    )
+
+    return storm_series
+
+def summarize_storms(storm_series):
+    n_storms = storm_series.max() # Tells how many storms (last storm number)
+    
+    # How many timestamps are in storms vs not
+    n_in_storm = (storm_series > 0).sum()
+    n_not_in_storm = (storm_series == 0).sum()
+    n_total = len(storm_series)
+
+    # Print summary
+    print(f"Total storms {n_storms:,}")
+    print(f"  Timstamps in a storm {n_in_storm}")
+    print(f"  Timstamps not in a storm {n_not_in_storm}")
+    
+def show_first_storms(storm_series, n_storms_to_show=5):
+
+    for storm_num in range(1, n_storms_to_show + 1):
+        # Get all timestamps for this storm
+        storm_mask = (storm_series == storm_num) # Gives true/false for storm series and gives this storms timestamps
+        storm_timestamps = storm_series[storm_mask].index
+
+        # First and last timestamp
+        start = storm_timestamps.min()
+        end = storm_timestamps.max()
+
+        # Finding duration
+
+        duration_dt = end - start
+        duration_hours = duration_dt.total_seconds() / 3600 # Gets duration in hours
+
+        print(f"{storm_num:<8} {str(start):<25} {str(end):<25} {duration_hours:<.1f} hours")
 
 def main():
 
@@ -121,5 +180,19 @@ def main():
 
     print(f"Before: {(changes == 1).sum():,} After: {n_storms:,}")
 
+    storm_starts = find_storm_starts(in_storm)
+    n_starts = storm_starts.sum()
+    print(f"Found {n_starts:,} storm starts")
+
+    storm_series = assign_storm_numbers(in_storm, storm_starts)
+
+    summarize_storms(storm_series)
+
+    show_first_storms(storm_series, n_storms_to_show=10)
+
 if __name__ == "__main__":
     main()
+
+# :, thousand comma separator
+
+# .total_seconds
