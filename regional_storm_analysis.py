@@ -10,6 +10,98 @@ logger = get_logger(__name__)
 MIN_GAUGES = 3
 INTEREVENT_HOURS = 6
 
+class Storm:
+    """
+    Represents a single storm event
+
+    Storm knows:
+        When it started and ended
+        Which timestamps belong to it
+        The rainfall data during the storm
+
+    A Storm can:
+        Calculate its duration
+        Calculate rainfall stats
+        Report on missing gages
+    
+    """
+    def __init__(self, number, rain_data):
+        
+        self.number = number
+        self.timestamps = rain_data.index
+        self.rain_data = rain_data
+
+        # Calulcate basic properties right off the bat
+        self.start_time = self.timestamps.min()
+        self.end_time = self.timestamps.max()
+        self.n_timestamps = len(self.timestamps)
+        self.n_gauges = len(rain_data.columns)
+
+    @property
+    def duration_hours(self):
+        # Storm duration in hours
+        delta = self.end_time - self.start_time
+        return delta.total_seconds() / 3600
+    
+    @property
+    def duration_days(self):
+        # Storm duration in days
+        return self.duration.hours / 24
+    
+    ## Rainfall Properties 
+
+
+    @property
+    def total_rain(self):
+        # Total rainfall across all gauges
+        return self.rain_data.sum().sum() # First sum gets per gauge totals, second sum adds them all
+    
+    @property
+    def gauge_totals(self):
+        # Rainfall total per gauge
+        return self.rain_data.sum().sort_values(ascending=False)
+    
+    @property
+    def wettest_gauge(self):
+        # Name of gauge with most rainfall
+        return self.gauge_totals.idxmax() # Returns index of max value, which is the gauge name
+    
+    @property
+    def peak_intensity(self):
+        # Highest rainfall at any single gauge
+        return self.rain_data.max().max()
+    
+
+    ## Missing Data Properties
+
+    @property
+    def avg_gauges_missing(self):
+        # Average number of gauges with missing data per timestamp
+        missing_per_ts = (self.rain_data > 0).isna().sum(axis=1) # Counts missing (True) per row
+        return missing_per_ts.mean() # Averages across all timestamps
+    
+    @property
+    def max_gauges_missing(self):
+        # Max gauges missing at any timestamp
+        missing_per_ts = (self.rain_data > 0).isna().sum(axis=1)
+        return missing_per_ts.max()
+    
+    def pct_data_missing(self):
+        # Percentage of all possible readings that are missing
+        # Total possible 
+        total_cells = self.n_timestamps * self.n_gauges
+
+    
+    def to_dict(self):
+        # Convert storm to dictionary (For creating dataframes)
+        return {
+            'storm_number': self.number
+
+        }
+
+    
+    
+
 def examine_single_timestamp(rain_df):
     first_row = rain_df.iloc[0]
     timestamp = rain_df.index[0]
@@ -164,7 +256,7 @@ def main():
     logger.info(f"Using threshold: at least {MIN_GAUGES} gauges")
     network_is_wet = define_network_wet(n_gauges_raining, MIN_GAUGES)
 
-    print(network_is_wet.head)
+    print(network_is_wet.head())
     summarize_wet_periods(network_is_wet)
     changes = count_transitions(network_is_wet)
 
