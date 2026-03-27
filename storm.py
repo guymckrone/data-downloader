@@ -111,6 +111,13 @@ class Storm:
         raining_per_ts = (self.rain_data > 0).sum(axis = 1)
         return raining_per_ts.min()
     
+    @property
+    def mean_intensity(self):
+        # Average rainfall rate (inches per hour)
+        if self.duration_hours == 0:
+            return 0
+        return self.mean_gauge_rain / self.duration_hours
+    
     # Outputs
     
     def to_dict(self):

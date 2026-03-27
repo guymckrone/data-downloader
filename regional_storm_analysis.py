@@ -39,7 +39,7 @@ def main():
     print(f"{'='*75}")
     print(f"Total storms: {catalog.n_storms:,}")
 
-    print(f"\n--- Top 10 Largest Storms ---")
+    print("\n--- Top 10 Largest Storms ---")
     print(f"{'Storm':<8} {'Date':<12} {'Hours':<8} {'Mean Rain':<10} {'Max Rain':<10}")
     print("-" * 55)
     
@@ -49,6 +49,17 @@ def main():
               f"{storm.duration_hours:<8.1f} "
               f"{storm.mean_gauge_rain:<10.3f} "
               f"{storm.max_gauge_rain:<10.3f}")
+        
+    print("\n--- Top 10 Most Intense Storms (rain per hour) ---")
+    print(f"{'Storm':<8} {'Date':<12} {'Hours':<8} {'Mean Rain':<10} {'Intensity':<10}")
+    print("-" * 55)
+
+    for storm in catalog.get_largest_storms(10, by='mean_intensity'):
+        print(f"{storm.number:<8} "
+            f"{storm.start_time.strftime('%Y-%m-%d'):<12} "
+            f"{storm.duration_hours:<8.1f} "
+            f"{storm.mean_gauge_rain:<10.3f} "
+            f"{storm.mean_intensity:<10.3f}")
 
     # Export
     catalog.to_csv(OUTPUT_DIR)
