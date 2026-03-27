@@ -18,11 +18,12 @@ class StormCatalog:
         print(catalog.n_storms)
     """
 
-    def __init__(self, rain_df, min_gauges=3, interevent_hours=6):
+    def __init__(self, rain_df, min_gauges=3, interevent_hours=6, rain_threshold=0.0):
         # Store inputs
         self.rain_df = rain_df
         self.min_gauges = min_gauges
         self.interevent_hours = interevent_hours
+        self.rain_threshold = rain_threshold
 
         # To fill in
         self.storms = None
@@ -59,7 +60,11 @@ class StormCatalog:
 
     def _identify_wet_periods(self):
         # Count gauges with rain at each timestep
-        n_gauges_raining = (self.rain_df > 0).sum(axis = 1)
+        n_gauges_raining = (self.rain_df > self.rain_threshold).sum(axis = 1)
+
+        # Log used variables
+        logger.info(f"  Rain Threshold: {self.rain_threshold}")
+        logger.info(f"  Min Gauges: {self.min_gauges}")
 
         # Network is wet when enough gauges have rain
         network_is_wet = n_gauges_raining >= self.min_gauges
@@ -142,6 +147,13 @@ class StormCatalog:
         )
         return sorted_storms[:n]
 
+    def get_storms_by_year(self, year=None):
+        if not year:
+            logger.error("You must provide a year.")
+            return
+        storms_in_year = [storm for storm in self.storms if storm.start_time.year == year]
+        return storms_in_year
+    
     ### Export Methods
 
     def to_dataframe(self):
@@ -182,5 +194,38 @@ class StormCatalog:
             return os.path.join(output_dir, filename)
         
         return filename
+
+    def summary(self):
+        
+        if not self.storms:
+            print("No storms found. Run find_storms() first.")
+            return
+        
+        print(f"\n{'='*50}")
+        print("STORM CATALOG SUMMARY")
+        print(f"{'='*50}")
+        
+        print(f"\nParameters:")
+        print(f"  Min gauges: {self.min_gauges}")
+        print(f"  Inter-event hours: {self.interevent_hours}")
+        
+        print(f"\nStorms:")
+        print(f"  Total: {self.n_storms:,}")
+        print(f"  First: {self.storms[0].start_time.date()}")
+        print(f"  Last: {self.storms[-1].start_time.date()}")
+        
+        # Duration stats
+        durations = [s.duration_hours for s in self.storms]
+        print(f"\nDuration (hours):")
+        print(f"  Min: {min(durations):.1f}")
+        print(f"  Max: {max(durations):.1f}")
+        print(f"  Mean: {sum(durations)/len(durations):.1f}")
+        
+        # Rainfall stats
+        rainfalls = [s.mean_gauge_rain for s in self.storms]
+        print(f"\nMean Rainfall (inches):")
+        print(f"  Min: {min(rainfalls):.3f}")
+        print(f"  Max: {max(rainfalls):.3f}")
+        print(f"  Mean: {sum(rainfalls)/len(rainfalls):.3f}")
 
         

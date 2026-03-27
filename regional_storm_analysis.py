@@ -1,8 +1,7 @@
 from config import OUTPUT_DIR, START_DATE, END_DATE
 from logging_setup import setup_logging, get_logger
 from data_loader import find_latest_database, load_rainfall_data, filter_by_date
-import numpy as np
-import pandas as pd
+from storm_catalog import StormCatalog
 
 setup_logging()
 logger = get_logger(__name__)
@@ -34,10 +33,26 @@ def main():
     )
     catalog.find_storms()
 
-    ### Summary Report
+    # Report
     print(f"\n{'='*75}")
-    print("REGIONAL STORM ANALYSIS SUMMARY")
+    print("REGIONAL STORM ANALYSIS")
     print(f"{'='*75}")
+    print(f"Total storms: {catalog.n_storms:,}")
+
+    print(f"\n--- Top 10 Largest Storms ---")
+    print(f"{'Storm':<8} {'Date':<12} {'Hours':<8} {'Mean Rain':<10} {'Max Rain':<10}")
+    print("-" * 55)
+    
+    for storm in catalog.get_largest_storms(10, by='mean_gauge_rain'):
+        print(f"{storm.number:<8} "
+              f"{storm.start_time.strftime('%Y-%m-%d'):<12} "
+              f"{storm.duration_hours:<8.1f} "
+              f"{storm.mean_gauge_rain:<10.3f} "
+              f"{storm.max_gauge_rain:<10.3f}")
+
+    # Export
+    catalog.to_csv(OUTPUT_DIR)
+    logger.info("Analysis complete!")
 
 if __name__ == "__main__":
     main()
