@@ -49,11 +49,16 @@ class SiteInfo:
     
     Different APIs call these different things, we standardize to site
     """
-    site_id: str
-    name: str
+    # Required fields
+    site_id: str        # Unique id
+    name: str           # Human readable name
+
+    # Location (not all apis provide it)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    source: str = ""
+
+    # Source tracking
+    source: str = "" # Which api this came from
 
     # Optional fields that may not be provided
     state: Optional[str] = None
@@ -61,9 +66,15 @@ class SiteInfo:
     elevation_ft: Optional[float] = None
 
     # Catch all for extras
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    # (Use default_factory= for all mutable defaults (list, dict, set)
+    metadata: Dict[str, Any] = field(default_factory=dict) # Creates a unique object each call. 
+    
 
     def __repr__(self):
+        """
+        A nice string representation. 
+        Default dataclass __repr__ includes all fields, this is shorter
+        """
         return f"SiteInfo({self.site_id}: {self.name})"
     
 # =========================================================
@@ -139,8 +150,8 @@ class BaseDataSource(ABC):
 
         state: two letter state code
         bbox: bounding box (minlon, minlat, maxlon, maxlat)
-        site_ids: list of specific site ids to retrieve
-        **kwargs: source specific parameters
+        site_ids: list of specific site ids to retrieve (if known)
+        **kwargs: source specific parameters - allows flexibility
 
         returns a list of SiteInfo objects
         """
@@ -200,7 +211,7 @@ class BaseDataSource(ABC):
             return pd.DataFrame()
         
         # Use each DataPoint's to_dict method
-        data = [dp.to_dict() for df to data_points]
+        data = [dp.to_dict() for dp in data_points]
         df = pd.DataFrame(data)
 
         # Ensure timestamp is datetime
