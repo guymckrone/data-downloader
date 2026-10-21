@@ -27,7 +27,7 @@ Notes to self:
 
 import os
 import struct
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -767,8 +767,12 @@ class USGSDataSource(BaseDataSource):
             raise ValueError("chunk_years must be a positive integer")
 
         parameter_code = self._resolve_parameter_code(parameter)
-        start_moment = self._coerce_datetime(start_date, "start_date")
-        end_moment = self._coerce_datetime(end_date, "end_date")
+        start_moment = self._coerce_datetime(
+            start_date, "start_date", assume_utc=True
+        )
+        end_moment = self._coerce_datetime(
+            end_date, "end_date", assume_utc=True
+        )
         if end_moment < start_moment:
             raise ValueError("end_date is before start_date")
 
@@ -1147,72 +1151,9 @@ class USGSDataSource(BaseDataSource):
             f"{sorted(USGSDataSource.PARAMETER_ALIASES)}"
         )
 
-    @staticmethod
-    def _add_years(moment: datetime, years: int) -> datetime:
-        """Shift a datetime by whole years, Feb 29 safe.
-
-        datetime.replace(year=...) blows up going from Feb 29 to
-        a non-leap year, so I fall back to Feb 28 there. (Same
-        trick as _add_years in the Aquarius downloader.)
-        """
-        try:
-            return moment.replace(year=moment.year + years)
-        except ValueError:  # Feb 29 -> non-leap target year
-            return moment.replace(year=moment.year + years, day=28)
-
-    @staticmethod
-    def _chunk_ranges(start: datetime, end: datetime, years: int):
-        """Yield (chunk_start, chunk_end) pairs covering start-end.
-
-        The last chunk stops at `end` instead of overshooting
-        it. Chunks share their boundary instant on purpose --
-        get_data() dedupes the duplicate reading that produces,
-        which is simpler than fiddling with interval edges.
-        """
-        if start == end:
-            yield start, end
-            return
-        chunk_start = start
-        while chunk_start < end:
-            chunk_end = min(
-                USGSDataSource._add_years(chunk_start, years), end
-            )
-            yield chunk_start, chunk_end
-            chunk_start = chunk_end
-
-    @staticmethod
-    def _coerce_datetime(value, name: str) -> datetime:
-        """Turn a date/datetime/string into an aware UTC datetime.
-
-        Naive values get stamped as UTC rather than rejected --
-        USGS works in UTC anyway, and forcing callers to build
-        timezone-aware datetimes for every call is annoying.
-        """
-        if isinstance(value, datetime):
-            moment = value
-        elif isinstance(value, date):
-            moment = datetime(value.year, value.month, value.day)
-        elif isinstance(value, str):
-            try:
-                moment = datetime.fromisoformat(value)
-            except ValueError:
-                raise ValueError(
-                    f"{name} isn't a valid ISO date/datetime: {value!r}"
-                )
-        else:
-            raise TypeError(
-                f"{name} must be a datetime, date, or ISO string, "
-                f"got {type(value).__name__}"
-            )
-
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc)
-
-    @staticmethod
-    def _datetime_to_text(value, name: str) -> str:
-        """Format a date/datetime/string as ISO text for USGS."""
-        return USGSDataSource._coerce_datetime(value, name).isoformat()
+    # _add_years / _chunk_ranges / _coerce_datetime live in
+    # BaseDataSource now -- I call _coerce_datetime with
+    # assume_utc=True (see get_data) since USGS works in UTC.
 
     @staticmethod
     def _feature_to_datapoint(

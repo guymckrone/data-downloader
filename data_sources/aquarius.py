@@ -28,7 +28,7 @@ Notes to self:
       creating the object to hit the network.
 """
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -768,53 +768,10 @@ class AquariusDataSource(BaseDataSource):
         )
         return all_points
 
-    @staticmethod
-    def _chunk_ranges(start: datetime, end: datetime, years: int):
-        """Yield (chunk_start, chunk_end) pairs covering a range.
-
-        Same chunking idea as USGS / the Aquarius full-record
-        export. Feb 29 falls back to Feb 28 on non-leap years.
-        """
-        if start == end:
-            yield start, end
-            return
-        chunk_start = start
-        while chunk_start < end:
-            try:
-                candidate = chunk_start.replace(
-                    year=chunk_start.year + years
-                )
-            except ValueError:  # Feb 29 -> non-leap year
-                candidate = chunk_start.replace(
-                    year=chunk_start.year + years, day=28
-                )
-            chunk_end = min(candidate, end)
-            yield chunk_start, chunk_end
-            chunk_start = chunk_end
-
-    @staticmethod
-    def _coerce_datetime(value, name: str) -> datetime:
-        """Turn a date/datetime/string into a datetime.
-
-        I keep whatever timezone (or lack of one) the caller
-        gave me -- Aquarius data is local portal time with an
-        offset on the returned points, not UTC like USGS.
-        """
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, date):
-            return datetime(value.year, value.month, value.day)
-        if isinstance(value, str):
-            try:
-                return datetime.fromisoformat(value)
-            except ValueError:
-                raise ValueError(
-                    f"{name} isn't a valid ISO date/datetime: {value!r}"
-                )
-        raise TypeError(
-            f"{name} must be a datetime, date, or ISO string, "
-            f"got {type(value).__name__}"
-        )
+    # _chunk_ranges / _coerce_datetime live in BaseDataSource
+    # now. I use the default flavour, which keeps whatever
+    # timezone the caller gave me -- Aquarius data is local
+    # portal time, not UTC like USGS.
 
     @staticmethod
     def _parse_timestamp(text: str) -> datetime:

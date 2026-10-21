@@ -6,7 +6,7 @@ This module defines the format  all data sources must follow
 
 from abc import ABC, abstractmethod             # Allows us to templace classes that cant be used directly
 from dataclasses import dataclass, field        # Automatically creates boilerplate code
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import logging
@@ -240,3 +240,76 @@ class BaseDataSource(ABC):
         """Store a value in cache"""
         if self._cache_enabled:
             self._cache[key] = value
+
+    # ---------------------------------------------------------
+    # SHARED DATE / CHUNK HELPERS
+    # ---------------------------------------------------------
+    # Every source needs the same boring plumbing: split a long
+    # date range into chunks and accept dates however the caller
+    # hands them over. I had this copied into all three sources,
+    # so it lives here now and they just inherit it.
+
+    @staticmethod
+    def _add_years(moment: datetime, years: int) -> datetime:
+        """Shift a datetime by whole years, Feb 29 safe.
+
+        datetime.replace(year=...) blows up going from Feb 29 to
+        a non-leap year, so I fall back to Feb 28 there.
+        """
+        try:
+            return moment.replace(year=moment.year + years)
+        except ValueError:  # Feb 29 -> non-leap target year
+            return moment.replace(year=moment.year + years, day=28)
+
+    @staticmethod
+    def _chunk_ranges(start: datetime, end: datetime, years: int):
+        """Yield (chunk_start, chunk_end) pairs covering start-end.
+
+        The last chunk stops at `end` instead of overshooting
+        it. Chunks share their boundary instant on purpose --
+        callers dedupe the duplicate reading that produces,
+        which is simpler than fiddling with interval edges.
+        """
+        if start == end:
+            yield start, end
+            return
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(
+                BaseDataSource._add_years(chunk_start, years), end
+            )
+            yield chunk_start, chunk_end
+            chunk_start = chunk_end
+
+    @staticmethod
+    def _coerce_datetime(value, name: str, assume_utc: bool = False) -> datetime:
+        """Turn a date/datetime/string into a datetime.
+
+        I keep whatever timezone (or lack of one) the caller
+        gave me -- Aquarius/SNOTEL work in local/naive time.
+        USGS passes assume_utc=True because it works in UTC:
+        naive values get stamped as UTC and everything comes
+        back aware so timestamps stay comparable.
+        """
+        if isinstance(value, datetime):
+            moment = value
+        elif isinstance(value, date):
+            moment = datetime(value.year, value.month, value.day)
+        elif isinstance(value, str):
+            try:
+                moment = datetime.fromisoformat(value)
+            except ValueError:
+                raise ValueError(
+                    f"{name} isn't a valid ISO date/datetime: {value!r}"
+                )
+        else:
+            raise TypeError(
+                f"{name} must be a datetime, date, or ISO string, "
+                f"got {type(value).__name__}"
+            )
+
+        if assume_utc:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(timezone.utc)
+        return moment

@@ -24,7 +24,7 @@ Notes to self:
       constructor option (pass False there, like Aquarius).
 """
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -724,33 +724,10 @@ class SNOTELDataSource(BaseDataSource):
             self.get_all_elements_data(site_ids, start_date, end_date, **kwargs)
         )
 
-    @staticmethod
-    def _add_years(moment: datetime, years: int) -> datetime:
-        """Shift by whole years; Feb 29 falls back to Feb 28."""
-        try:
-            return moment.replace(year=moment.year + years)
-        except ValueError:  # Feb 29 -> non-leap target year
-            return moment.replace(year=moment.year + years, day=28)
-
-    @staticmethod
-    def _chunk_ranges(start: datetime, end: datetime, years: int):
-        """Yield (chunk_start, chunk_end) pairs covering a range.
-
-        Same chunking pattern as the other two sources. Yes,
-        this is the third copy of this helper -- if a fourth
-        source ever shows up, that's my cue to pull it into
-        base.py instead of copying it again.
-        """
-        if start == end:
-            yield start, end
-            return
-        chunk_start = start
-        while chunk_start < end:
-            chunk_end = min(
-                SNOTELDataSource._add_years(chunk_start, years), end
-            )
-            yield chunk_start, chunk_end
-            chunk_start = chunk_end
+    # _add_years / _chunk_ranges / _coerce_datetime live in
+    # BaseDataSource now (that fourth-source cue I left myself
+    # in the old copy of _chunk_ranges -- turned out three
+    # copies was already enough).
 
     @staticmethod
     def _resolve_element_code(parameter: str) -> str:
@@ -772,32 +749,6 @@ class SNOTELDataSource(BaseDataSource):
             f"element code (WTEQ, SNWD, SMS, ...) or one of: "
             f"{sorted(set(ELEMENT_NAMES.values()))}"
         )
-
-    @staticmethod
-    def _coerce_datetime(value, name: str) -> datetime:
-        """Turn a date/datetime/string into a datetime."""
-        if isinstance(value, datetime):
-            moment = value
-        elif isinstance(value, date):
-            moment = datetime(value.year, value.month, value.day)
-        elif isinstance(value, str):
-            try:
-                moment = datetime.fromisoformat(value)
-            except ValueError:
-                raise ValueError(
-                    f"{name} isn't a valid ISO date/datetime: {value!r}"
-                )
-        else:
-            raise TypeError(
-                f"{name} must be a datetime, date, or ISO string, "
-                f"got {type(value).__name__}"
-            )
-        return moment
-
-    @staticmethod
-    def _coerce_date_text(value, name: str) -> str:
-        """Format a date/datetime/string as YYYY-MM-DD."""
-        return SNOTELDataSource._coerce_datetime(value, name).date().isoformat()
 
     @staticmethod
     def _value_to_datapoint(
