@@ -7,9 +7,11 @@ instead of the older SOAP service.
 Done so far:
     get_sites()                -- SNOTEL stations as SiteInfo
     get_available_parameters() -- elements measured at a station
+    get_data()                 -- download element data
 
 TODO:
-    get_data() -- download element data (daily/hourly)
+    chunking for very long records, all-elements mode
+    (same parity steps as USGS/Aquarius got)
 
 Notes to self:
     - Station ids are triplets: "302:OR:SNTL" is
@@ -22,7 +24,7 @@ Notes to self:
       constructor option (pass False there, like Aquarius).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -364,8 +366,19 @@ class SNOTELDataSource(BaseDataSource):
         }
 
     # ---------------------------------------------------------
-    # TODO: DATA DOWNLOAD (not implemented yet)
+    # DATA DOWNLOAD
     # ---------------------------------------------------------
+
+    # Extra names I might type that should map to a code.
+    _EXTRA_ALIASES = {
+        "swe": "WTEQ",
+        "snow_water_equivalent": "WTEQ",
+        "snow_depth": "SNWD",
+        "soil_moisture": "SMS",
+        "soil_temperature": "STO",
+        "precipitation_accumulation": "PREC",
+        "air_temperature": "TOBS",
+    }
 
     def get_data(
         self,
@@ -375,5 +388,185 @@ class SNOTELDataSource(BaseDataSource):
         end_date: datetime,
         **kwargs
     ) -> List[DataPoint]:
-        """Get time series data. TODO: not wired up yet."""
-        raise NotImplementedError("SNOTEL get_data() is not implemented yet.")
+        """
+        Get time series data.
+
+        site_ids: one or more stations, triplets or bare ids
+            (bare ids can take state= in kwargs).
+        parameter: element code ("WTEQ") or a friendly name
+            ("Snow Water Equivalent", "soil moisture", ...).
+        start_date / end_date: datetime, date, or ISO string.
+            AWDB works in whole days, so these get sent as
+            YYYY-MM-DD regardless of any time I pass.
+
+        kwargs:
+            duration: "DAILY" (default), "HOURLY", "MONTHLY",
+                etc. -- whatever the station catalogue lists.
+            ordinal: sensor number (default 1, the primary
+                sensor). Soil stations can have several; check
+                the catalogue and pass this to pick another.
+            state: state code for building triplets out of
+                bare station ids.
+
+        All sites go in ONE request -- AWDB accepts a list of
+        triplets, unlike USGS where I loop per site.
+
+        returns a list of DataPoint objects, oldest first.
+        """
+        duration = str(kwargs.pop("duration", "DAILY")).upper()
+        ordinal = kwargs.pop("ordinal", 1)
+        state = kwargs.pop("state", None)
+        if kwargs:
+            raise ValueError(
+                f"Unsupported get_data() argument(s): {sorted(kwargs)}. "
+                "Supported: duration, ordinal, state"
+            )
+
+        element_code = self._resolve_element_code(parameter)
+        triplets = [
+            self._normalize_triplet(site_id, state=state)
+            for site_id in site_ids
+        ]
+        begin_text = self._coerce_date_text(start_date, "start_date")
+        end_text = self._coerce_date_text(end_date, "end_date")
+        if end_text < begin_text:
+            raise ValueError("end_date is before start_date")
+
+        response = self._get_json(
+            f"{self.base_url}/data",
+            params={
+                "stationTriplets": ",".join(triplets),
+                "elements": element_code,
+                "ordinal": str(ordinal),
+                "duration": duration,
+                "beginDate": begin_text,
+                "endDate": end_text,
+                "periodRef": "END",
+                "centralTendencyType": "NONE",
+                "returnFlags": "true",
+                "returnOriginalValues": "false",
+                "returnSuspectData": "false",
+                "alwaysReturnDailyFeb29": "false",
+            },
+        )
+
+        points: List[DataPoint] = []
+        skipped = 0
+        for station_data in response or []:
+            if station_data.get("error"):
+                raise ValueError(
+                    f"AWDB error for "
+                    f"{station_data.get('stationTriplet')}: "
+                    f"{station_data['error']}"
+                )
+            triplet = station_data.get("stationTriplet", "")
+            for element_data in station_data.get("data") or []:
+                element_info = element_data.get("stationElement", {})
+                for raw_value in element_data.get("values") or []:
+                    point = self._value_to_datapoint(
+                        raw_value, triplet, element_info
+                    )
+                    if point is None:
+                        skipped += 1
+                    else:
+                        points.append(point)
+
+        points.sort(key=lambda p: (p.timestamp, p.location_id))
+        self.logger.info(
+            f"{element_code} ({duration}): {len(points):,} points "
+            f"from {len(triplets)} station(s) "
+            f"({begin_text} to {end_text})"
+            + (f", {skipped} missing values skipped" if skipped else "")
+        )
+        return points
+
+    @staticmethod
+    def _resolve_element_code(parameter: str) -> str:
+        """Turn "WTEQ" / "Snow Water Equivalent" into "WTEQ"."""
+        text = str(parameter).strip()
+        if text.upper() in ELEMENT_NAMES or text.isupper():
+            # Codes are short and uppercase; anything all-caps
+            # I treat as a code even if it's not in my friendly
+            # name table (AWDB has far more codes than I listed).
+            return text.upper()
+        key = text.lower().replace(" ", "_").replace("-", "_")
+        if key in SNOTELDataSource._EXTRA_ALIASES:
+            return SNOTELDataSource._EXTRA_ALIASES[key]
+        for code, name in ELEMENT_NAMES.items():
+            if name.lower() == text.lower():
+                return code
+        raise ValueError(
+            f"Unknown element: {parameter!r}. Pass an AWDB "
+            f"element code (WTEQ, SNWD, SMS, ...) or one of: "
+            f"{sorted(set(ELEMENT_NAMES.values()))}"
+        )
+
+    @staticmethod
+    def _coerce_date_text(value, name: str) -> str:
+        """Format a date/datetime/string as YYYY-MM-DD."""
+        if isinstance(value, datetime):
+            moment = value
+        elif isinstance(value, date):
+            moment = datetime(value.year, value.month, value.day)
+        elif isinstance(value, str):
+            try:
+                moment = datetime.fromisoformat(value)
+            except ValueError:
+                raise ValueError(
+                    f"{name} isn't a valid ISO date/datetime: {value!r}"
+                )
+        else:
+            raise TypeError(
+                f"{name} must be a datetime, date, or ISO string, "
+                f"got {type(value).__name__}"
+            )
+        return moment.date().isoformat()
+
+    @staticmethod
+    def _value_to_datapoint(
+        raw_value: Dict[str, Any],
+        triplet: str,
+        element_info: Dict[str, Any],
+    ) -> Optional[DataPoint]:
+        """Convert one AWDB value entry to a DataPoint.
+
+        The parameter label carries the depth/ordinal when
+        they're not the plain default, so soil moisture at
+        -8 in can't get mixed up with soil moisture at -20 in
+        in the same DataFrame (same trick as USGS daily labels).
+        """
+        value = raw_value.get("value")
+        if value is None or value == "":
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        code = element_info.get("elementCode", "")
+        label = ELEMENT_NAMES.get(code, code)
+        height_depth = element_info.get("heightDepth")
+        ordinal = element_info.get("ordinal")
+        if height_depth not in (None, "", 0, "0"):
+            label = f"{label} ({height_depth} in)"
+        if ordinal not in (None, "", 1, "1"):
+            label = f"{label} #{ordinal}"
+
+        date_text = str(raw_value.get("date", "")).replace("Z", "+00:00")
+        timestamp = datetime.fromisoformat(date_text)
+
+        quality_parts = []
+        if raw_value.get("qcFlag"):
+            quality_parts.append(f"qc={raw_value['qcFlag']}")
+        if raw_value.get("qaFlag"):
+            quality_parts.append(f"qa={raw_value['qaFlag']}")
+
+        return DataPoint(
+            timestamp=timestamp,
+            value=value,
+            location_id=triplet,
+            parameter=label,
+            unit=element_info.get("storedUnitCode", ""),
+            source="SNOTEL",
+            quality_flag="|".join(quality_parts) if quality_parts else None,
+        )
