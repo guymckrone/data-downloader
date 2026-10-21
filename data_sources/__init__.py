@@ -16,6 +16,7 @@ Usage:
 
 from .aquarius import AquariusDataSource
 from .base import BaseDataSource, DataPoint, SiteInfo
+from .snotel import SNOTELDataSource
 from .usgs import USGSDataSource
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "BaseDataSource",
     "DataPoint",
     "SiteInfo",
+    "SNOTELDataSource",
     "USGSDataSource",
 ]
