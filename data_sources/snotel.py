@@ -9,8 +9,9 @@ Done so far:
     get_available_parameters() -- elements measured at a station
     get_data()                 -- download element data
 
-TODO:
-    all-elements mode (same parity step USGS/Aquarius got)
+    get_all_elements_data()    -- download every element at a
+                                  station (preview first with
+                                  preview_all_elements())
 
 Notes to self:
     - Station ids are triplets: "302:OR:SNTL" is
@@ -448,15 +449,39 @@ class SNOTELDataSource(BaseDataSource):
         if end_moment < start_moment:
             raise ValueError("end_date is before start_date")
 
+        return self._download_elements(
+            triplets, [element_code], start_moment, end_moment,
+            duration=duration, ordinal=ordinal,
+            chunk_years=chunk_years,
+        )
+
+    def _download_elements(
+        self,
+        triplets: List[str],
+        element_codes: List[str],
+        start_moment: datetime,
+        end_moment: datetime,
+        duration: str = "DAILY",
+        ordinal: int = 1,
+        chunk_years: Optional[int] = None,
+    ) -> List[DataPoint]:
+        """Download one or more elements for the given stations.
+
+        AWDB takes a list of elements in one request, so all
+        mode doesn't have to loop element-by-element the way
+        USGS loops series -- the chunk loop below is the only
+        loop. get_data() uses this with a single element.
+        """
         if chunk_years is None:
             chunk_years = (
                 self.HOURLY_CHUNK_YEARS if duration == "HOURLY"
                 else self.DAILY_CHUNK_YEARS
             )
         ranges = list(self._chunk_ranges(start_moment, end_moment, chunk_years))
+        label = ",".join(element_codes)
         if len(ranges) > 1:
             self.logger.info(
-                f"{element_code} ({duration}): downloading in "
+                f"{label} ({duration}): downloading in "
                 f"{len(ranges)} chunks of {chunk_years} year(s)"
             )
 
@@ -467,7 +492,7 @@ class SNOTELDataSource(BaseDataSource):
                 f"{self.base_url}/data",
                 params={
                     "stationTriplets": ",".join(triplets),
-                    "elements": element_code,
+                    "elements": label,
                     "ordinal": str(ordinal),
                     "duration": duration,
                     "beginDate": chunk_start.date().isoformat(),
@@ -514,7 +539,7 @@ class SNOTELDataSource(BaseDataSource):
         )
 
         self.logger.info(
-            f"{element_code} ({duration}): {len(points):,} points "
+            f"{label} ({duration}): {len(points):,} points "
             f"from {len(triplets)} station(s) "
             f"({start_moment.date()} to {end_moment.date()})"
             + (f", {skipped} missing values skipped" if skipped else "")
@@ -522,6 +547,182 @@ class SNOTELDataSource(BaseDataSource):
                if duplicates else "")
         )
         return points
+
+    # ---------------------------------------------------------
+    # ALL-ELEMENTS MODE
+    # ---------------------------------------------------------
+    # Driven off the element catalogue, preview and download
+    # share _select_elements(). One difference from USGS:
+    # AWDB returns several elements per request, so the
+    # download is one chunked multi-element call (with a
+    # per-element fallback if that big call fails).
+
+    def _select_elements(
+        self,
+        site_ids: List[str],
+        duration: str = "DAILY",
+        elements: Optional[List[str]] = None,
+        ordinal: int = 1,
+    ) -> List[Dict[str, str]]:
+        """Work out which catalogue rows all-elements covers."""
+        catalogue = self.get_available_parameters_for_sites(site_ids)
+
+        wanted_codes = None
+        if elements:
+            wanted_codes = {
+                self._resolve_element_code(e) for e in elements
+            }
+
+        selected = [
+            row for row in catalogue
+            if row["duration"].upper() == duration.upper()
+            and row["ordinal"] == str(ordinal)
+            and (wanted_codes is None or row["code"] in wanted_codes)
+        ]
+        selected.sort(key=lambda p: (p["site_id"], p["code"]))
+        return selected
+
+    def preview_all_elements(
+        self,
+        site_ids: List[str],
+        duration: str = "DAILY",
+        elements: Optional[List[str]] = None,
+        ordinal: int = 1,
+    ) -> pd.DataFrame:
+        """Show what an all-elements download WOULD pull."""
+        selected = self._select_elements(
+            site_ids, duration=duration, elements=elements,
+            ordinal=ordinal,
+        )
+        columns = [
+            "site_id", "code", "name", "unit", "duration",
+            "ordinal", "height_depth", "begin", "end",
+        ]
+        self.logger.info(
+            f"All-elements preview: {len(selected)} element(s) "
+            f"at {len({row['site_id'] for row in selected})} station(s) "
+            f"({duration}, ordinal {ordinal})"
+        )
+        if not selected:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame.from_records(selected, columns=columns)
+
+    def get_all_elements_data(
+        self,
+        site_ids: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        duration: str = "DAILY",
+        elements: Optional[List[str]] = None,
+        ordinal: int = 1,
+        chunk_years: Optional[int] = None,
+        state: Optional[str] = None,
+    ) -> List[DataPoint]:
+        """Download every element at the given stations.
+
+        duration / ordinal: only catalogue rows matching these
+            are covered (defaults: daily, primary sensor).
+        elements: optional shortlist of element codes/names.
+            None = everything the stations measure.
+
+        If the combined multi-element request fails, I retry
+        element-by-element so one bad element doesn't sink
+        the rest (same failure rule as the other sources).
+
+        returns a list of DataPoint objects. Preview first.
+        """
+        selected = self._select_elements(
+            site_ids, duration=duration, elements=elements,
+            ordinal=ordinal,
+        )
+        if not selected:
+            raise ValueError(
+                "No elements matched the all-elements filters. "
+                "Check preview_all_elements()."
+            )
+
+        triplets = [
+            self._normalize_triplet(site_id, state=state)
+            for site_id in site_ids
+        ]
+        element_codes = sorted({row["code"] for row in selected})
+        start_moment = self._coerce_datetime(start_date, "start_date")
+        end_moment = self._coerce_datetime(end_date, "end_date")
+        if end_moment < start_moment:
+            raise ValueError("end_date is before start_date")
+
+        per_site: Dict[str, int] = {}
+        for row in selected:
+            per_site[row["site_id"]] = per_site.get(row["site_id"], 0) + 1
+        self.logger.info(
+            f"All-elements download: {len(selected)} catalogue "
+            f"rows, {len(element_codes)} distinct elements across "
+            f"{len(per_site)} station(s) -- "
+            + ", ".join(
+                f"{site}: {count}" for site, count in sorted(per_site.items())
+            )
+        )
+
+        try:
+            all_points = self._download_elements(
+                triplets, element_codes, start_moment, end_moment,
+                duration=duration.upper(), ordinal=ordinal,
+                chunk_years=chunk_years,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"Combined all-elements request failed ({exc}); "
+                "retrying element by element"
+            )
+            all_points = []
+            failures = 0
+            for code in element_codes:
+                try:
+                    points = self._download_elements(
+                        triplets, [code], start_moment, end_moment,
+                        duration=duration.upper(), ordinal=ordinal,
+                        chunk_years=chunk_years,
+                    )
+                except Exception as element_exc:
+                    failures += 1
+                    self.logger.error(
+                        f"Skipping element {code}: {element_exc}"
+                    )
+                    continue
+                all_points.extend(points)
+
+            if failures and not all_points:
+                raise RuntimeError(
+                    f"All {failures} elements failed to download. "
+                    "See log above for the individual errors."
+                )
+            if failures:
+                self.logger.warning(
+                    f"All-elements download finished with "
+                    f"{failures} failed elements out of "
+                    f"{len(element_codes)}"
+                )
+
+        all_points.sort(
+            key=lambda p: (p.timestamp, p.location_id, p.parameter)
+        )
+        self.logger.info(
+            f"All-elements download complete: "
+            f"{len(all_points):,} points"
+        )
+        return all_points
+
+    def get_all_elements_dataframe(
+        self,
+        site_ids: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        **kwargs
+    ) -> pd.DataFrame:
+        """get_all_elements_data(), converted to a DataFrame."""
+        return self.to_dataframe(
+            self.get_all_elements_data(site_ids, start_date, end_date, **kwargs)
+        )
 
     @staticmethod
     def _add_years(moment: datetime, years: int) -> datetime:
