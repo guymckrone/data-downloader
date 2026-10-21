@@ -9,9 +9,11 @@ Done so far:
     get_site()                 -- one location by id
     get_sites_from_shapefile() -- locations in a shapefile's bbox
     get_available_parameters() -- list downloadable series at a site
+    get_data()                 -- download continuous series
 
 TODO:
-    get_data()                 -- download selected series
+    get_data() daily support   -- daily mean/max/min series
+    chunking for long records, multi-parameter downloads
 
 Notes to self:
     - GeoJSON coordinates come back as [longitude, latitude].
@@ -22,7 +24,7 @@ Notes to self:
 
 import os
 import struct
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -87,6 +89,26 @@ class USGSDataSource(BaseDataSource):
     # Page size for API requests. Just a performance knob, the
     # pagination in _fetch_all_features() handles the rest.
     DEFAULT_PAGE_LIMIT = 1000
+
+    # Friendly names I can use in get_data() instead of codes.
+    # Codes stay strings -- "00060" as an int loses the zeros.
+    PARAMETER_ALIASES = {
+        "discharge": "00060",
+        "streamflow": "00060",
+        "flow": "00060",
+        "gage_height": "00065",
+        "stage": "00065",
+        "water_temperature": "00010",
+        "temperature_water": "00010",
+        "air_temperature": "00020",
+        "temperature_air": "00020",
+        "precipitation": "00045",
+        "rainfall": "00045",
+        "specific_conductance": "00095",
+        "dissolved_oxygen": "00300",
+        "ph": "00400",
+        "turbidity": "63680",
+    }
 
     # Extra filters get_sites() will pass through to the API.
     # I check against this list so a typo (site_typ=) errors out
@@ -648,12 +670,13 @@ class USGSDataSource(BaseDataSource):
         }
 
     # ---------------------------------------------------------
-    # TODO: DATA DOWNLOAD (not implemented yet)
+    # DATA DOWNLOAD
     # ---------------------------------------------------------
-    # Has to exist or BaseDataSource won't let me instantiate
-    # this class at all (abstractmethod). Raising for now --
-    # I'd rather see an error than a fake empty result that
-    # looks like "no data available".
+    # For now this only does continuous (sub-daily, usually
+    # 15-minute) instantaneous series. Daily means/max/mins live
+    # in a different USGS collection ("daily") -- that's next.
+    # I'm not caching downloads either, they can be huge; the
+    # parameter metadata lookup inside here is already cached.
 
     def get_data(
         self,
@@ -666,7 +689,251 @@ class USGSDataSource(BaseDataSource):
         """
         Get time series data.
 
-        TODO: implement this next. Start with one site / one
-        parameter as a smoke test, then expand from there.
+        site_ids: one or more sites, bare numbers or full ids.
+        parameter: a parameter code ("00060") or a name I have
+            in PARAMETER_ALIASES ("discharge", "gage_height",
+            "water_temperature", "turbidity", ...).
+        start_date / end_date: datetime, date, or ISO string.
+            Naive values are treated as UTC, because that's what
+            USGS timestamps come back in. Note USGS treats the
+            interval as closed -- a reading timestamped exactly
+            at end_date is included. So datetime(2026, 10, 21)
+            as the end will include the 2026-10-21 00:00 reading.
+
+        kwargs:
+            time_series_id: grab exactly this series. This is
+                the escape hatch for sites with several sensors
+                for the same parameter -- grab the id from
+                get_available_parameters() and pass it here.
+            computation: which computation to pick when a
+                parameter has several. Only "Instantaneous" is
+                supported for now; anything else errors out
+                until daily support lands.
+            sublocation: pick the series at this sublocation
+                (e.g. "Middle WT Sensor").
+
+        returns a list of DataPoint objects, oldest first.
+        Use to_dataframe() on it for a pandas DataFrame.
         """
-        raise NotImplementedError("USGS get_data() is not implemented yet.")
+        time_series_id = kwargs.pop("time_series_id", None)
+        computation = kwargs.pop("computation", "Instantaneous")
+        sublocation = kwargs.pop("sublocation", None)
+        if kwargs:
+            raise ValueError(
+                f"Unsupported get_data() argument(s): {sorted(kwargs)}. "
+                "Supported: time_series_id, computation, sublocation"
+            )
+        if computation.lower() != "instantaneous":
+            raise NotImplementedError(
+                f"computation={computation!r} isn't supported yet. "
+                "Only Instantaneous (continuous) series for now; "
+                "daily Mean/Max/Min support is the next step."
+            )
+
+        parameter_code = self._resolve_parameter_code(parameter)
+        start_text = self._datetime_to_text(start_date, "start_date")
+        end_text = self._datetime_to_text(end_date, "end_date")
+
+        all_points: List[DataPoint] = []
+        for site_id in site_ids:
+            normalized = self._normalize_site_id(site_id)
+            series = self._resolve_series(
+                normalized, parameter_code,
+                time_series_id=time_series_id,
+                computation=computation,
+                sublocation=sublocation,
+            )
+
+            features = self._fetch_all_features(
+                params={
+                    "f": "json",
+                    "limit": self.DEFAULT_PAGE_LIMIT,
+                    "monitoring_location_id": normalized,
+                    "time_series_id": series["time_series_id"],
+                    "datetime": f"{start_text}/{end_text}",
+                },
+                collection="continuous",
+            )
+
+            points = []
+            skipped = 0
+            for feature in features:
+                point = self._feature_to_datapoint(feature, series)
+                if point is None:
+                    skipped += 1
+                else:
+                    points.append(point)
+
+            points.sort(key=lambda p: p.timestamp)
+            self.logger.info(
+                f"{normalized} {series['name']}: {len(points):,} points "
+                f"({start_text[:10]} to {end_text[:10]})"
+                + (f", {skipped} missing values skipped" if skipped else "")
+            )
+            all_points.extend(points)
+
+        all_points.sort(key=lambda p: p.timestamp)
+        return all_points
+
+    def _resolve_series(
+        self,
+        site_id: str,
+        parameter_code: str,
+        time_series_id: Optional[str] = None,
+        computation: str = "Instantaneous",
+        sublocation: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Pick the one series a get_data() call should download.
+
+        This is where I stop myself from silently blending two
+        sensors together. If the filters don't narrow the site's
+        series down to exactly one, I error out and list the
+        candidates with their time_series_ids so the caller can
+        pick explicitly.
+        """
+        available = self.get_available_parameters(site_id)
+
+        if time_series_id:
+            for series in available:
+                if series["time_series_id"] == time_series_id:
+                    return series
+            raise ValueError(
+                f"time_series_id {time_series_id!r} not found at "
+                f"{site_id}. Check get_available_parameters()."
+            )
+
+        candidates = [s for s in available if s["code"] == parameter_code]
+        if sublocation:
+            candidates = [
+                s for s in candidates
+                if s["sublocation"].lower() == sublocation.lower()
+            ]
+        candidates = [
+            s for s in candidates
+            if s["computation"].lower() == computation.lower()
+        ]
+
+        if not candidates:
+            offered = sorted({
+                f"{s['code']} {s['name']} ({s['computation']}"
+                + (f", {s['sublocation']}" if s["sublocation"] else "")
+                + ")"
+                for s in available if s["code"] == parameter_code
+            })
+            raise ValueError(
+                f"No {computation} series for parameter "
+                f"{parameter_code} at {site_id}."
+                + (f" Available for this parameter: {offered}"
+                   if offered else
+                   " This parameter isn't available at this site -- "
+                   "check get_available_parameters().")
+            )
+
+        # Last tiebreak before giving up and asking: I'll take the
+        # primary (reviewed) series over a provisional one.
+        primaries = [s for s in candidates if s["primary"].lower() == "primary"]
+        if len(primaries) == 1:
+            return primaries[0]
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        listing = "; ".join(
+            f"{s['name']} ({s['computation']}"
+            + (f", {s['sublocation']}" if s["sublocation"] else "")
+            + f", {s['begin'][:10]} to {s['end'][:10]}"
+            + f", time_series_id={s['time_series_id']})"
+            for s in candidates
+        )
+        raise ValueError(
+            f"Parameter {parameter_code} at {site_id} matches "
+            f"{len(candidates)} series and I won't guess which one. "
+            f"Pass time_series_id= (or sublocation=) to pick: {listing}"
+        )
+
+    @staticmethod
+    def _resolve_parameter_code(parameter: str) -> str:
+        """Turn "discharge" or "00060" into the code "00060"."""
+        text = str(parameter).strip().lower().replace(" ", "_").replace("-", "_")
+        if text in USGSDataSource.PARAMETER_ALIASES:
+            return USGSDataSource.PARAMETER_ALIASES[text]
+        if text.isdigit() and len(text) <= 5:
+            # zfill pads "60" back to "00060".
+            return text.zfill(5)
+        raise ValueError(
+            f"Unknown parameter: {parameter!r}. Pass a 5-digit "
+            f"parameter code or one of: "
+            f"{sorted(USGSDataSource.PARAMETER_ALIASES)}"
+        )
+
+    @staticmethod
+    def _datetime_to_text(value, name: str) -> str:
+        """Format a date/datetime/string as ISO text for USGS.
+
+        Naive datetimes get stamped as UTC rather than rejected --
+        USGS works in UTC anyway, and forcing callers to build
+        timezone-aware datetimes for every call is annoying.
+        """
+        if isinstance(value, datetime):
+            moment = value
+        elif isinstance(value, date):
+            moment = datetime(value.year, value.month, value.day)
+        elif isinstance(value, str):
+            try:
+                moment = datetime.fromisoformat(value)
+            except ValueError:
+                raise ValueError(
+                    f"{name} isn't a valid ISO date/datetime: {value!r}"
+                )
+        else:
+            raise TypeError(
+                f"{name} must be a datetime, date, or ISO string, "
+                f"got {type(value).__name__}"
+            )
+
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _feature_to_datapoint(
+        feature: Dict[str, Any],
+        series: Dict[str, str],
+    ) -> Optional[DataPoint]:
+        """Convert one continuous-data feature to a DataPoint.
+
+        Returns None for missing readings so the caller can count
+        and skip them. USGS uses nulls now, but I check for the
+        old -999999 sentinel too in case it still shows up.
+        """
+        props = feature.get("properties", {})
+
+        raw_value = props.get("value")
+        if raw_value is None or raw_value == "":
+            return None
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if value == -999999:
+            return None
+
+        # Approval + qualifier both describe data quality, so I
+        # keep them together in quality_flag ("Provisional",
+        # "Approved", sometimes with qualifier text after a |).
+        quality_parts = [
+            part for part in
+            [props.get("approval_status"), props.get("qualifier")]
+            if part
+        ]
+
+        return DataPoint(
+            timestamp=datetime.fromisoformat(props["time"]),
+            value=value,
+            location_id=props.get("monitoring_location_id", ""),
+            # Series name ("Discharge"), falling back to the code.
+            parameter=series.get("name") or props.get("parameter_code", ""),
+            unit=props.get("unit_of_measure") or series.get("unit", ""),
+            source="USGS",
+            quality_flag="|".join(quality_parts) if quality_parts else None,
+        )
