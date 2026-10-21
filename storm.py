@@ -35,7 +35,9 @@ class Storm:
     @property
     def duration_days(self):
         # Storm duration in days
-        return self.duration.hours / 24
+        # (Was self.duration.hours -- there's no self.duration,
+        # so this would have crashed if anything ever called it.)
+        return self.duration_hours / 24
     
     ## Rainfall Properties 
 
@@ -74,13 +76,16 @@ class Storm:
     @property
     def avg_gauges_missing(self):
         # Average number of gauges with missing data per timestamp
-        missing_per_ts = (self.rain_data > 0).isna().sum(axis=1) # Counts missing (True) per row
+        # Note to self: check isna() on the rain data itself. Doing
+        # (rain_data > 0).isna() first turns everything True/False,
+        # which is never NaN, so this used to always report 0.
+        missing_per_ts = self.rain_data.isna().sum(axis=1) # Counts missing (True) per row
         return missing_per_ts.mean() # Averages across all timestamps
-    
+
     @property
     def max_gauges_missing(self):
         # Max gauges missing at any timestamp
-        missing_per_ts = (self.rain_data > 0).isna().sum(axis=1)
+        missing_per_ts = self.rain_data.isna().sum(axis=1)
         return missing_per_ts.max()
     
     @property
