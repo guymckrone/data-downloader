@@ -26,6 +26,24 @@ DATASET_CONFIGS = {
         "must_contain_any": ["HYDRA-1"],
         "must_start_before": None,
         "must_end_after": None
+    },
+
+    # Every 15-minute precipitation dataset, regardless of record length.
+    # (Brought over from the portland-bes-tools version.)
+    "all": {
+        "must_contain_all": ["precip", "15min"],
+        "must_contain_any": None,
+        "must_start_before": None,
+        "must_end_after": None
+    },
+
+    # "Primary" precipitation datasets, regardless of interval.
+    # (Brought over from the portland-bes-tools version.)
+    "primary": {
+        "must_contain_all": ["precip", "Primary"],
+        "must_contain_any": None,
+        "must_start_before": None,
+        "must_end_after": None
     }
 }
 
