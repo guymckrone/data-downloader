@@ -10,8 +10,7 @@ Done so far:
     get_data()                 -- download element data
 
 TODO:
-    chunking for very long records, all-elements mode
-    (same parity steps as USGS/Aquarius got)
+    all-elements mode (same parity step USGS/Aquarius got)
 
 Notes to self:
     - Station ids are triplets: "302:OR:SNTL" is
@@ -67,6 +66,12 @@ class SNOTELDataSource(BaseDataSource):
         sites = snotel.get_sites(state="OR")
         params = snotel.get_available_parameters("302:OR:SNTL")
     """
+
+    # Default chunk sizes for get_data(), same reasoning as
+    # USGS: hourly data is dense (24 readings/day), daily is
+    # one value a day so a decade per request is still small.
+    HOURLY_CHUNK_YEARS = 1
+    DAILY_CHUNK_YEARS = 10
 
     def __init__(self, timeout: int = 90, verify_ssl: bool = True):
         """Initialize the SNOTEL data source.
@@ -407,78 +412,144 @@ class SNOTELDataSource(BaseDataSource):
                 the catalogue and pass this to pick another.
             state: state code for building triplets out of
                 bare station ids.
+            chunk_years: split the date range into chunks of
+                this many years (one request per chunk).
+                Defaults: 1 year for HOURLY, 10 for everything
+                else. Long records need this -- one request
+                for 40 years of hourly data is asking for a
+                timeout.
 
-        All sites go in ONE request -- AWDB accepts a list of
-        triplets, unlike USGS where I loop per site.
+        All sites go in each request together -- AWDB accepts
+        a list of triplets, unlike USGS where I loop per site.
 
         returns a list of DataPoint objects, oldest first.
         """
         duration = str(kwargs.pop("duration", "DAILY")).upper()
         ordinal = kwargs.pop("ordinal", 1)
         state = kwargs.pop("state", None)
+        chunk_years = kwargs.pop("chunk_years", None)
         if kwargs:
             raise ValueError(
                 f"Unsupported get_data() argument(s): {sorted(kwargs)}. "
-                "Supported: duration, ordinal, state"
+                "Supported: duration, ordinal, state, chunk_years"
             )
+        if chunk_years is not None and (
+            not isinstance(chunk_years, int) or chunk_years < 1
+        ):
+            raise ValueError("chunk_years must be a positive integer")
 
         element_code = self._resolve_element_code(parameter)
         triplets = [
             self._normalize_triplet(site_id, state=state)
             for site_id in site_ids
         ]
-        begin_text = self._coerce_date_text(start_date, "start_date")
-        end_text = self._coerce_date_text(end_date, "end_date")
-        if end_text < begin_text:
+        start_moment = self._coerce_datetime(start_date, "start_date")
+        end_moment = self._coerce_datetime(end_date, "end_date")
+        if end_moment < start_moment:
             raise ValueError("end_date is before start_date")
 
-        response = self._get_json(
-            f"{self.base_url}/data",
-            params={
-                "stationTriplets": ",".join(triplets),
-                "elements": element_code,
-                "ordinal": str(ordinal),
-                "duration": duration,
-                "beginDate": begin_text,
-                "endDate": end_text,
-                "periodRef": "END",
-                "centralTendencyType": "NONE",
-                "returnFlags": "true",
-                "returnOriginalValues": "false",
-                "returnSuspectData": "false",
-                "alwaysReturnDailyFeb29": "false",
-            },
-        )
+        if chunk_years is None:
+            chunk_years = (
+                self.HOURLY_CHUNK_YEARS if duration == "HOURLY"
+                else self.DAILY_CHUNK_YEARS
+            )
+        ranges = list(self._chunk_ranges(start_moment, end_moment, chunk_years))
+        if len(ranges) > 1:
+            self.logger.info(
+                f"{element_code} ({duration}): downloading in "
+                f"{len(ranges)} chunks of {chunk_years} year(s)"
+            )
 
         points: List[DataPoint] = []
         skipped = 0
-        for station_data in response or []:
-            if station_data.get("error"):
-                raise ValueError(
-                    f"AWDB error for "
-                    f"{station_data.get('stationTriplet')}: "
-                    f"{station_data['error']}"
-                )
-            triplet = station_data.get("stationTriplet", "")
-            for element_data in station_data.get("data") or []:
-                element_info = element_data.get("stationElement", {})
-                for raw_value in element_data.get("values") or []:
-                    point = self._value_to_datapoint(
-                        raw_value, triplet, element_info
-                    )
-                    if point is None:
-                        skipped += 1
-                    else:
-                        points.append(point)
+        for chunk_start, chunk_end in ranges:
+            response = self._get_json(
+                f"{self.base_url}/data",
+                params={
+                    "stationTriplets": ",".join(triplets),
+                    "elements": element_code,
+                    "ordinal": str(ordinal),
+                    "duration": duration,
+                    "beginDate": chunk_start.date().isoformat(),
+                    "endDate": chunk_end.date().isoformat(),
+                    "periodRef": "END",
+                    "centralTendencyType": "NONE",
+                    "returnFlags": "true",
+                    "returnOriginalValues": "false",
+                    "returnSuspectData": "false",
+                    "alwaysReturnDailyFeb29": "false",
+                },
+            )
 
-        points.sort(key=lambda p: (p.timestamp, p.location_id))
+            for station_data in response or []:
+                if station_data.get("error"):
+                    raise ValueError(
+                        f"AWDB error for "
+                        f"{station_data.get('stationTriplet')}: "
+                        f"{station_data['error']}"
+                    )
+                triplet = station_data.get("stationTriplet", "")
+                for element_data in station_data.get("data") or []:
+                    element_info = element_data.get("stationElement", {})
+                    for raw_value in element_data.get("values") or []:
+                        point = self._value_to_datapoint(
+                            raw_value, triplet, element_info
+                        )
+                        if point is None:
+                            skipped += 1
+                        else:
+                            points.append(point)
+
+        # Chunk boundaries are inclusive at both ends, so the
+        # boundary day/hour comes back twice. Dedupe on the
+        # full series identity, not just the timestamp -- two
+        # stations share timestamps all the time.
+        unique = {
+            (p.timestamp, p.location_id, p.parameter, p.unit): p
+            for p in points
+        }
+        duplicates = len(points) - len(unique)
+        points = sorted(
+            unique.values(), key=lambda p: (p.timestamp, p.location_id)
+        )
+
         self.logger.info(
             f"{element_code} ({duration}): {len(points):,} points "
             f"from {len(triplets)} station(s) "
-            f"({begin_text} to {end_text})"
+            f"({start_moment.date()} to {end_moment.date()})"
             + (f", {skipped} missing values skipped" if skipped else "")
+            + (f", {duplicates} boundary duplicates dropped"
+               if duplicates else "")
         )
         return points
+
+    @staticmethod
+    def _add_years(moment: datetime, years: int) -> datetime:
+        """Shift by whole years; Feb 29 falls back to Feb 28."""
+        try:
+            return moment.replace(year=moment.year + years)
+        except ValueError:  # Feb 29 -> non-leap target year
+            return moment.replace(year=moment.year + years, day=28)
+
+    @staticmethod
+    def _chunk_ranges(start: datetime, end: datetime, years: int):
+        """Yield (chunk_start, chunk_end) pairs covering a range.
+
+        Same chunking pattern as the other two sources. Yes,
+        this is the third copy of this helper -- if a fourth
+        source ever shows up, that's my cue to pull it into
+        base.py instead of copying it again.
+        """
+        if start == end:
+            yield start, end
+            return
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(
+                SNOTELDataSource._add_years(chunk_start, years), end
+            )
+            yield chunk_start, chunk_end
+            chunk_start = chunk_end
 
     @staticmethod
     def _resolve_element_code(parameter: str) -> str:
@@ -502,8 +573,8 @@ class SNOTELDataSource(BaseDataSource):
         )
 
     @staticmethod
-    def _coerce_date_text(value, name: str) -> str:
-        """Format a date/datetime/string as YYYY-MM-DD."""
+    def _coerce_datetime(value, name: str) -> datetime:
+        """Turn a date/datetime/string into a datetime."""
         if isinstance(value, datetime):
             moment = value
         elif isinstance(value, date):
@@ -520,7 +591,12 @@ class SNOTELDataSource(BaseDataSource):
                 f"{name} must be a datetime, date, or ISO string, "
                 f"got {type(value).__name__}"
             )
-        return moment.date().isoformat()
+        return moment
+
+    @staticmethod
+    def _coerce_date_text(value, name: str) -> str:
+        """Format a date/datetime/string as YYYY-MM-DD."""
+        return SNOTELDataSource._coerce_datetime(value, name).date().isoformat()
 
     @staticmethod
     def _value_to_datapoint(
