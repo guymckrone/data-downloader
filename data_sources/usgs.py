@@ -11,9 +11,12 @@ Done so far:
     get_available_parameters() -- list downloadable series at a site
     get_data()                 -- download continuous series
 
+    get_all_series_data()      -- download every series at a site
+                                  (with preview_all_series() to
+                                  see what that would pull first)
+
 TODO:
-    multi-parameter downloads, "download all series at a site"
-    mode
+    annual peak ("Water Year") series, multi-site reporting
 
 Notes to self:
     - GeoJSON coordinates come back as [longitude, latitude].
@@ -845,6 +848,202 @@ class USGSDataSource(BaseDataSource):
 
         all_points.sort(key=lambda p: p.timestamp)
         return all_points
+
+    # ---------------------------------------------------------
+    # ALL-SERIES MODE
+    # ---------------------------------------------------------
+    # "Download everything this site has" -- driven off the
+    # catalogue from get_available_parameters(), never off a
+    # hardcoded parameter list. The preview and the download
+    # share _select_series(), so what I preview is exactly
+    # what I download. Nothing here runs unless it's called;
+    # available does not mean automatic.
+
+    def _select_series(
+        self,
+        site_ids: List[str],
+        include_daily: bool = True,
+        primary_only: bool = False,
+        parameters: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        """Work out which series an all-series call covers."""
+        catalogue = self.get_available_parameters_for_sites(site_ids)
+
+        wanted_codes = None
+        if parameters:
+            wanted_codes = {
+                self._resolve_parameter_code(p) for p in parameters
+            }
+
+        selected = []
+        skipped_unsupported = 0
+        for series in catalogue:
+            # "Water Year" series are the annual peak/event
+            # family. Neither the continuous nor daily
+            # collection serves them properly yet, so I skip
+            # them on purpose instead of pulling empty results
+            # and pretending they were covered.
+            if series.get("computation_period") == "Water Year":
+                skipped_unsupported += 1
+                continue
+            if not include_daily and (
+                series.get("computation_period") == "Daily"
+            ):
+                continue
+            if primary_only and series["primary"].lower() != "primary":
+                continue
+            if wanted_codes is not None and series["code"] not in wanted_codes:
+                continue
+            selected.append(series)
+
+        if skipped_unsupported:
+            self.logger.info(
+                f"Skipping {skipped_unsupported} annual peak/event "
+                "series (not supported yet)"
+            )
+        return selected
+
+    def preview_all_series(
+        self,
+        site_ids: List[str],
+        include_daily: bool = True,
+        primary_only: bool = False,
+        parameters: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Show what an all-series download WOULD pull.
+
+        Same filters as get_all_series_data(). I use this to
+        sanity-check the series count and date coverage before
+        committing to a download that could be millions of
+        points. Returns the filtered catalogue as a DataFrame.
+        """
+        selected = self._select_series(
+            site_ids,
+            include_daily=include_daily,
+            primary_only=primary_only,
+            parameters=parameters,
+        )
+        catalogue_df = self.available_parameters_dataframe(site_ids)
+        if catalogue_df.empty or not selected:
+            return catalogue_df.iloc[0:0]
+        keep = {series["time_series_id"] for series in selected}
+        preview = catalogue_df[
+            catalogue_df["time_series_id"].isin(keep)
+        ].reset_index(drop=True)
+        self.logger.info(
+            f"All-series preview: {len(preview)} series across "
+            f"{preview['site_id'].nunique()} site(s)"
+        )
+        return preview
+
+    def get_all_series_data(
+        self,
+        site_ids: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        include_daily: bool = True,
+        primary_only: bool = False,
+        parameters: Optional[List[str]] = None,
+        chunk_years: Optional[int] = None,
+    ) -> List[DataPoint]:
+        """Download every available series at the given sites.
+
+        site_ids: one or more sites, bare numbers or full ids.
+        include_daily: False = continuous series only.
+        primary_only: True = only USGS "Primary" (reviewed)
+            series, skipping provisional-only ones.
+        parameters: optional shortlist of parameters (codes or
+            names like "discharge") to limit the download to.
+            None = everything.
+        chunk_years: passed through to get_data().
+
+        One failing series doesn't sink the rest: I log it,
+        keep going, and report the count at the end. If every
+        series fails, this raises instead of handing back an
+        empty list that looks like "no data".
+
+        returns a list of DataPoint objects. Expect this to be
+        big on long date ranges -- preview_all_series() first.
+        """
+        selected = self._select_series(
+            site_ids,
+            include_daily=include_daily,
+            primary_only=primary_only,
+            parameters=parameters,
+        )
+        if not selected:
+            raise ValueError(
+                "No series matched the all-series filters for "
+                f"{site_ids}. Check preview_all_series()."
+            )
+
+        per_site = {}
+        for series in selected:
+            per_site.setdefault(series["site_id"], []).append(series)
+        self.logger.info(
+            f"All-series download: {len(selected)} series across "
+            f"{len(per_site)} site(s) -- "
+            + ", ".join(
+                f"{site}: {len(series_list)}"
+                for site, series_list in sorted(per_site.items())
+            )
+        )
+
+        all_points: List[DataPoint] = []
+        failures = 0
+        for series in selected:
+            try:
+                points = self.get_data(
+                    [series["site_id"]],
+                    series["code"],
+                    start_date,
+                    end_date,
+                    time_series_id=series["time_series_id"],
+                    chunk_years=chunk_years,
+                )
+            except Exception as exc:
+                # One bad series (a dead sensor, a USGS hiccup)
+                # shouldn't cost me the other two dozen.
+                failures += 1
+                self.logger.error(
+                    f"Skipping series {series['time_series_id']} "
+                    f"({series['name']}, {series['computation']} at "
+                    f"{series['site_id']}): {exc}"
+                )
+                continue
+            all_points.extend(points)
+
+        if failures and not all_points:
+            raise RuntimeError(
+                f"All {failures} series failed to download. "
+                "See log above for the individual errors."
+            )
+        if failures:
+            self.logger.warning(
+                f"All-series download finished with {failures} "
+                f"failed series out of {len(selected)}"
+            )
+
+        all_points.sort(
+            key=lambda p: (p.timestamp, p.location_id, p.parameter)
+        )
+        self.logger.info(
+            f"All-series download complete: {len(all_points):,} "
+            f"points from {len(selected) - failures} series"
+        )
+        return all_points
+
+    def get_all_series_dataframe(
+        self,
+        site_ids: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        **kwargs
+    ) -> pd.DataFrame:
+        """get_all_series_data(), converted to a DataFrame."""
+        return self.to_dataframe(
+            self.get_all_series_data(site_ids, start_date, end_date, **kwargs)
+        )
 
     def _resolve_series(
         self,
