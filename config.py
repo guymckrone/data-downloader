@@ -8,13 +8,9 @@ BASE_URL = os.getenv("AQUARIUS_BASE_URL")
 USERNAME = os.getenv("AQUARIUS_USERNAME")
 PASSWORD = os.getenv("AQUARIUS_PASSWORD")
 
-# USGS Water Data API key -- OPTIONAL.
-# Without a key, USGS allows roughly 50 requests per IP per hour;
-# with a free key (https://api.waterdata.usgs.gov/signup) that
-# rises to about 1,000 requests per hour. os.getenv() returns
-# None when the variable is not set, and USGSDataSource treats
-# None as "connect anonymously" -- so leaving USGS_API_KEY out
-# of your .env file entirely is a valid, supported setup.
+# USGS Water Data API key (optional). No key = ~50 requests/hour,
+# free key from https://api.waterdata.usgs.gov/signup = ~1,000/hour.
+# None here just means USGSDataSource runs anonymously.
 USGS_API_KEY = os.getenv("USGS_API_KEY")
 # Date filters (set to None to use all data)
 START_DATE = '1980-01-01'

@@ -1,49 +1,23 @@
 """
-USGS Water Data source (formerly commonly called NWIS).
+USGS Water Data source (the modernized NWIS APIs).
 
-Feature status
---------------
-Feature 1 (this file, first implementation step):
-    get_sites() -- discover monitoring locations, with three
-    user-facing selection styles built on top of it:
-      1. get_site(site_id)              -- one individual gauge
-      2. get_sites(site_ids=[...])      -- a batch of gauges
-      3. get_sites_from_shapefile(...)  -- gauges inside the
-         bounding box of an uploaded polygon shapefile
-    A future GUI (map clicks, drawn rectangles) will call these
-    same plain-Python entry points; no GUI code belongs here.
+Uses the OGC API v1 at https://api.waterdata.usgs.gov/ogcapi/v1
+instead of the legacy waterservices.usgs.gov endpoints.
 
-Planned next features, intentionally NOT implemented yet:
-    get_available_parameters() -- list every downloadable series at a site.
-    get_data()                 -- download selected series.
+Done so far:
+    get_sites()                -- find monitoring locations
+    get_site()                 -- one location by id
+    get_sites_from_shapefile() -- locations in a shapefile's bbox
+    get_available_parameters() -- list downloadable series at a site
 
-Why start with sites?
-    Discovery comes before download. Until we can reliably answer
-    "which locations exist, and where are they?", parameter lists and
-    downloads have nothing solid to attach to. Each planned feature
-    will be added and verified one at a time.
+TODO:
+    get_data()                 -- download selected series
 
-API choice
-----------
-This uses the modernized USGS Water Data OGC API (v1):
-
-    https://api.waterdata.usgs.gov/ogcapi/v1
-
-This replaces the legacy waterservices.usgs.gov NWIS endpoints.
-The monitoring-locations collection returns GeoJSON "features".
-Two consequences shape the code below:
-
-1. Coordinates arrive in GeoJSON order: [longitude, latitude].
-   (Reading them backwards is a classic GIS bug -- Oregon sites
-   would end up plotted in the ocean / wrong hemisphere.)
-
-2. States are filtered by their two-digit ANSI/FIPS code, not by
-   postal abbreviation: Oregon is "41", not "OR". Our public
-   interface keeps accepting the friendlier state='OR' used by
-   BaseDataSource and translates it internally.
-
-Nothing is downloaded unless get_sites() is called, and get_sites()
-only retrieves location metadata -- no time-series data.
+Notes to self:
+    - GeoJSON coordinates come back as [longitude, latitude].
+    - The API filters states by FIPS code ("41"), not by postal
+      code ("OR"), so I translate that in _state_to_fips().
+    - get_sites() only pulls location metadata, no time series.
 """
 
 import os
@@ -53,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+import pandas as pd
 import requests
 
 from .base import BaseDataSource, DataPoint, SiteInfo
@@ -62,10 +37,8 @@ from .base import BaseDataSource, DataPoint, SiteInfo
 # STATE LOOKUP TABLES
 # =========================================================
 # (postal abbreviation, ANSI/FIPS code, full name)
-# The USGS API filters on the FIPS code, while people (and our
-# BaseDataSource contract) naturally think in postal codes or
-# state names. Keeping one master table lets us derive all the
-# lookup directions we need without duplicating data.
+# One table, then I derive the lookups I need from it below
+# instead of maintaining three separate copies.
 _STATE_TABLE = [
     ("AL", "01", "Alabama"), ("AK", "02", "Alaska"),
     ("AZ", "04", "Arizona"), ("AR", "05", "Arkansas"),
@@ -104,22 +77,20 @@ _STATE_NAME_TO_FIPS = {name.lower(): fips for _, fips, name in _STATE_TABLE}
 
 
 class USGSDataSource(BaseDataSource):
-    """Download monitoring-location metadata from USGS Water Data.
+    """USGS Water Data (NWIS) data source.
 
-    Example (Feature 1):
+    Example:
         usgs = USGSDataSource()
         sites = usgs.get_sites(state="OR", site_type_code="ST")
     """
 
-    # Page size sent to the API. Larger pages mean fewer requests,
-    # but the follow-`next`-link pagination below means correctness
-    # never depends on this number -- it is only a performance knob.
+    # Page size for API requests. Just a performance knob, the
+    # pagination in _fetch_all_features() handles the rest.
     DEFAULT_PAGE_LIMIT = 1000
 
-    # Keyword arguments get_sites() currently knows how to forward
-    # to the USGS API. Rejecting unknown names (instead of silently
-    # ignoring them) prevents a typo like `site_typ="ST"` from
-    # returning an unexpectedly huge, unfiltered result set.
+    # Extra filters get_sites() will pass through to the API.
+    # I check against this list so a typo (site_typ=) errors out
+    # instead of silently returning every site in the state.
     _SUPPORTED_SITE_KWARGS = {
         "agency_code",
         "site_type_code",
@@ -131,36 +102,26 @@ class USGSDataSource(BaseDataSource):
     def __init__(self, timeout: int = 30, api_key: Optional[str] = None):
         """Initialize the USGS data source.
 
-        timeout: seconds to wait for an API response before giving
-            up. Without a timeout, a hung connection would freeze
-            the calling script forever -- a lesson worth building
-            in from the very first source that uses requests.
-        api_key: optional USGS API key. If not passed directly, it
-            is looked up in config.USGS_API_KEY (which config.py
-            reads from the USGS_API_KEY variable in your .env
-            file), then in the environment itself. If no key is
-            found anywhere, the source connects anonymously --
-            fully functional, just rate-limited by USGS to roughly
-            50 requests/hour instead of ~1,000 with a key.
+        timeout: seconds to wait on an API response before
+            giving up (no timeout = a hung server hangs me too).
+        api_key: optional USGS API key. Falls back to
+            config.USGS_API_KEY (.env), then the USGS_API_KEY
+            environment variable. No key anywhere = anonymous,
+            which still works, just ~50 requests/hour instead
+            of ~1,000 with a key.
         """
-        super().__init__()  # Gives us self.logger and the cache
+        super().__init__()  # logger + cache from BaseDataSource
 
         self.timeout = timeout
 
-        # Resolve the key once, here, so every request made later
-        # automatically carries it. The resolution order is:
-        #   1. api_key= argument (wins over everything -- useful
-        #      for tests or for using a different key one-off)
-        #   2. config.USGS_API_KEY (the normal .env-driven path)
-        #   3. USGS_API_KEY environment variable (fallback if this
-        #      package is ever used without this project's config)
-        # An empty/whitespace string counts as "no key": a blank
-        # `USGS_API_KEY=` line in .env must not send a blank key.
+        # Figure out the key once here so all later requests just
+        # carry it. Order: argument, then config, then env var.
+        # Blank strings count as no key (an empty USGS_API_KEY=
+        # line in .env shouldn't send a blank key to USGS).
         self._api_key = self._resolve_api_key(api_key)
 
-        # A Session reuses the underlying connection across requests
-        # (faster when pagination makes many calls) and lets us set
-        # headers once instead of on every request.
+        # Session so connections get reused across paginated
+        # requests and headers only have to be set once.
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/geo+json, application/json",
@@ -168,9 +129,8 @@ class USGSDataSource(BaseDataSource):
         })
 
         if self._api_key:
-            # Header, NOT a ?api_key= query parameter: URLs tend to
-            # get copied into logs and bug reports, headers do not.
-            # The key itself is never logged anywhere in this class.
+            # Send it as a header, not ?api_key= in the URL --
+            # URLs end up in logs, headers don't. Never log the key.
             self.session.headers["X-Api-Key"] = self._api_key
             self.logger.info(
                 "USGS API key loaded (higher rate limit applies)"
@@ -189,10 +149,8 @@ class USGSDataSource(BaseDataSource):
             return api_key.strip()
 
         try:
-            # config.py loads .env and exposes USGS_API_KEY. This
-            # import lives inside the method (not at file top) so
-            # the data_sources package still imports cleanly if it
-            # is ever reused outside this project's folder layout.
+            # Imported here, not at the top, so data_sources still
+            # imports if it's ever used outside this project layout.
             from config import USGS_API_KEY as config_api_key
         except ImportError:
             config_api_key = None
@@ -226,7 +184,7 @@ class USGSDataSource(BaseDataSource):
         return "https://api.waterdata.usgs.gov/ogcapi/v1"
 
     # ---------------------------------------------------------
-    # FEATURE 1: SITE DISCOVERY
+    # SITE DISCOVERY
     # ---------------------------------------------------------
 
     def get_sites(
@@ -285,24 +243,19 @@ class USGSDataSource(BaseDataSource):
         return sites
 
     # ---------------------------------------------------------
-    # SELECTION STYLES (the backend a future GUI will call)
+    # SITE SELECTION
     # ---------------------------------------------------------
-    # A GUI will eventually let a user click one gauge on a map,
-    # click several, or draw a rectangle. Those interactions all
-    # reduce to plain Python values -- one id, a list of ids, or a
-    # (min_lon, min_lat, max_lon, max_lat) tuple -- which is why
-    # the methods below take and return only plain types and
-    # SiteInfo objects. Keeping them GUI-free now means the future
-    # GUI is a thin display layer, not a rewrite.
+    # Three ways I actually pick gauges: one by id, a list of ids,
+    # or everything in an area. Keeping these as plain id / list /
+    # bbox calls for now -- if I build the map GUI later it can
+    # call these same methods (click = one id, drawn box = bbox).
 
     def get_site(self, site_id: str) -> SiteInfo:
-        """Get ONE monitoring location by id (selection style 1).
+        """Get one monitoring location by id.
 
         site_id: bare number ("14211400") or full id
-            ("USGS-14211400").
-
-        This is a convenience wrapper: a caller selecting a single
-        gauge should not have to handle a one-item list.
+            ("USGS-14211400"). Just a wrapper so I don't have to
+            unwrap a one-item list for the single-gauge case.
         """
         return self.get_sites(site_ids=[site_id])[0]
 
@@ -313,20 +266,15 @@ class USGSDataSource(BaseDataSource):
     ) -> List[SiteInfo]:
         """Get monitoring locations within a shapefile's bbox.
 
-        Selection style 3: the user supplies a polygon shapefile
-        (e.g. a watershed boundary); we read the bounding box
-        stored in the shapefile and query USGS for the locations
-        inside that rectangle. Any get_sites() filters
-        (site_type_code, etc.) may be passed as kwargs.
+        I use this with watershed boundary shapefiles. It reads
+        the bbox out of the shapefile and queries that rectangle,
+        so sites near the corners can fall outside the actual
+        polygon. Exact point-in-polygon filtering is TODO for
+        whenever I bring in a geometry library.
 
-        IMPORTANT limitation: a bounding box is a rectangle around
-        the polygon, not the polygon itself, so locations near the
-        corners may fall outside the actual polygon. Filtering to
-        the exact polygon shape needs point-in-polygon geometry
-        (a future feature, once a geometry library is adopted).
-
-        shapefile_path: path to the .shp file (its .shx/.dbf/.prj
-            sidecar files are expected alongside it, as usual).
+        shapefile_path: path to the .shp file (.shx/.dbf/.prj
+            sidecars expected next to it). get_sites() filters
+            like site_type_code can be passed as kwargs.
         """
         bbox = self.shapefile_bbox(shapefile_path)
         self.logger.info(f"Shapefile bounding box: {bbox}")
@@ -335,19 +283,16 @@ class USGSDataSource(BaseDataSource):
     def shapefile_bbox(self, shapefile_path: str) -> Tuple[float, float, float, float]:
         """Read the bounding box stored in a shapefile's header.
 
-        Every .shp file begins with a fixed 100-byte header, and
-        bytes 36-67 of it hold the overall bounding box as four
-        little-endian double-precision numbers (Xmin, Ymin, Xmax,
-        Ymax). Reading just the header means we need no GIS library
-        for this step -- `struct.unpack_from` interprets the raw
-        bytes. ("<" = little-endian byte order, "4d" = 4 doubles.)
+        The .shp header is 100 bytes and bytes 36-67 hold the
+        bbox as four little-endian doubles (Xmin, Ymin, Xmax,
+        Ymax), so I can get it with struct and skip pulling in a
+        GIS library just for this. "<" = little-endian, "4d" =
+        four doubles.
 
-        The box is validated as longitude/latitude. A shapefile in
-        a projected coordinate system (e.g. State Plane, whose
-        coordinates are large foot/metre values) would otherwise
-        produce a nonsense query against the USGS API, so -- until
-        reprojection support is added -- such files fail here with
-        an explanation instead of silently returning wrong sites.
+        I validate the result as lon/lat. A projected shapefile
+        (State Plane etc., big foot/metre values) would otherwise
+        quietly query the wrong place on Earth, so those fail
+        here until I add reprojection support.
         """
         path = Path(shapefile_path)
 
@@ -363,7 +308,7 @@ class USGSDataSource(BaseDataSource):
             raise ValueError(f"File is too small to be a shapefile: {path}")
 
         # Bytes 0-3: file code, big-endian (">i"), always 9994.
-        # Checking it catches "user pointed at the wrong file" early.
+        # Cheap check that I actually got a shapefile.
         file_code = struct.unpack_from(">i", header, 0)[0]
         if file_code != 9994:
             raise ValueError(f"Not a shapefile (bad file code): {path}")
@@ -386,13 +331,12 @@ class USGSDataSource(BaseDataSource):
         return (xmin, ymin, xmax, ymax)
 
     def _check_shapefile_crs(self, shp_path: Path) -> None:
-        """Sanity-check a shapefile's .prj coordinate-system file.
+        """Check the shapefile's .prj file if there is one.
 
-        A projected CRS (WKT starting with PROJCS) is rejected even
-        if its numbers happen to fall in lon/lat ranges. A missing
-        .prj is only a warning: the lon/lat range check above has
-        already passed, so assuming WGS84 is reasonable -- but the
-        user deserves to know an assumption was made.
+        Projected CRSs (WKT starting with PROJCS) get rejected.
+        No .prj at all = just a warning, since the lon/lat range
+        check already passed I'll assume WGS84, but I want the
+        log to say I assumed it.
         """
         prj_path = shp_path.with_suffix(".prj")
         if not prj_path.is_file():
@@ -418,7 +362,7 @@ class USGSDataSource(BaseDataSource):
         bbox: Optional[tuple] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """Translate our friendly filters into USGS query parameters."""
+        """Build the USGS query parameters for a site search."""
         params: Dict[str, Any] = {
             "f": "json",
             "limit": kwargs.pop("limit", self.DEFAULT_PAGE_LIMIT),
@@ -461,18 +405,23 @@ class USGSDataSource(BaseDataSource):
             "('OR'), a state name ('Oregon'), or a FIPS code ('41')."
         )
 
-    def _fetch_all_features(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fetch every page of a monitoring-locations query.
+    def _fetch_all_features(
+        self,
+        params: Dict[str, Any],
+        collection: str = "monitoring-locations",
+    ) -> List[Dict[str, Any]]:
+        """Fetch every page of an OGC collection query.
 
-        The OGC API paginates: each response contains at most
-        `limit` features plus, when more remain, a link with
-        rel="next" pointing at the following page. We follow those
-        links until one has no "next" link. Trusting the API's own
-        link (rather than rebuilding URLs with offsets ourselves)
-        means we automatically use whatever pagination scheme the
-        server prefers -- here, an opaque cursor token.
+        Responses come back with at most `limit` features plus a
+        rel="next" link (with a cursor token in it) when there's
+        another page. I follow those links until there isn't one,
+        rather than building offset URLs myself.
+
+        collection: "monitoring-locations" for sites,
+            "time-series-metadata" for parameters. Same
+            pagination either way, hence the shared helper.
         """
-        url: Optional[str] = f"{self.base_url}/collections/monitoring-locations/items"
+        url: Optional[str] = f"{self.base_url}/collections/{collection}/items"
         features: List[Dict[str, Any]] = []
 
         while url:
@@ -531,36 +480,34 @@ class USGSDataSource(BaseDataSource):
 
     @staticmethod
     def _feature_to_site(feature: Dict[str, Any]) -> SiteInfo:
-        """Convert one GeoJSON feature into our standard SiteInfo.
+        """Convert one GeoJSON feature into a SiteInfo.
 
-        This is the heart of the adapter pattern: USGS field names
-        stay inside this class, and the rest of the project only
-        ever sees SiteInfo.
+        All the USGS-specific field names get translated here so
+        nothing else in the project has to know them.
         """
         props = feature.get("properties", {})
 
-        # GeoJSON Point coordinates are [longitude, latitude].
-        # Some locations may lack geometry, hence the safe defaults.
+        # GeoJSON Point coordinates are [longitude, latitude],
+        # and some locations have no geometry at all.
         coordinates = (feature.get("geometry") or {}).get("coordinates") or [None, None]
         longitude, latitude = coordinates[0], coordinates[1]
 
         state_fips = props.get("state_code")
 
         return SiteInfo(
-            # The full id ("USGS-14211400") is what other USGS
-            # endpoints expect as monitoring_location_id, so it --
-            # not the bare number -- becomes our canonical site_id.
+            # Other USGS endpoints want the full id
+            # ("USGS-14211400") as monitoring_location_id, so
+            # that's what I keep as site_id, not the bare number.
             site_id=props.get("id", ""),
             name=props.get("monitoring_location_name", ""),
             latitude=latitude,
             longitude=longitude,
             source="USGS",
-            # Prefer the familiar postal code over the raw FIPS code.
+            # Postal code back out of the FIPS code when I can.
             state=_STATE_FIPS_TO_ABBR.get(state_fips, props.get("state_name")),
             county=props.get("county_name"),
             elevation_ft=props.get("altitude"),
-            # Everything USGS-specific that SiteInfo has no field
-            # for goes in metadata rather than being thrown away.
+            # USGS stuff SiteInfo has no field for -> metadata.
             metadata={
                 "monitoring_location_number": props.get("monitoring_location_number"),
                 "agency_code": props.get("agency_code"),
@@ -576,27 +523,137 @@ class USGSDataSource(BaseDataSource):
         )
 
     # ---------------------------------------------------------
-    # PLANNED FEATURES (not yet implemented)
+    # PARAMETER / SERIES DISCOVERY
     # ---------------------------------------------------------
-    # These methods must exist for the class to satisfy the
-    # BaseDataSource contract (Python will not let us create a
-    # USGSDataSource at all if an @abstractmethod is missing).
-    # For now they fail loudly and explain themselves, which is far
-    # better than returning empty data that looks like a real
-    # "no data available" answer.
+    # One parameter at a site is usually several series:
+    # discharge (00060) might be instantaneous readings, a daily
+    # mean, a daily max... statistic_id / computation_identifier
+    # are what tell them apart. So each dict here is one series,
+    # with its begin/end so I know the period of record before
+    # I try downloading anything from it.
 
     def get_available_parameters(self, site_id: str) -> List[Dict[str, str]]:
         """
-        Get list of available parameters at a site.
+        Get list of available parameters (series) at a site.
 
-        PLANNED (Feature 2): will query the USGS time-series-metadata
-        collection so users can see every downloadable series at a
-        site before choosing what to download.
+        site_id: bare number ("14211400") or full id
+            ("USGS-14211400").
+
+        returns a list of dicts, one per downloadable series, with
+        keys: site_id, code, name, unit, statistic_id, computation,
+        begin, end, time_series_id, primary, description,
+        sublocation, web_description. I need those last two --
+        some sites have upper/middle/bottom sensors for the same
+        parameter and that's the only way to tell them apart.
+        All values are strings ("" when USGS has none), sorted by
+        code then computation so the list reads in a sane order.
         """
-        raise NotImplementedError(
-            "USGS get_available_parameters() is planned as Feature 2 "
-            "and is not implemented yet."
+        normalized = self._normalize_site_id(site_id)
+
+        cache_key = f"parameters|site={normalized}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        features = self._fetch_all_features(
+            params={
+                "f": "json",
+                "limit": self.DEFAULT_PAGE_LIMIT,
+                "monitoring_location_id": normalized,
+            },
+            collection="time-series-metadata",
         )
+
+        parameters = [self._feature_to_parameter(f) for f in features]
+        parameters.sort(key=lambda p: (p["code"], p["computation"], p["statistic_id"]))
+
+        if not parameters:
+            # Empty is a real answer (site exists, no series in
+            # this collection) -- just log it loudly so I notice.
+            self.logger.warning(
+                f"No time series found for {normalized}. The site "
+                "may be discontinued or publish no continuous data."
+            )
+        else:
+            self.logger.info(
+                f"Found {len(parameters):,} available series at {normalized}"
+            )
+
+        self._set_cached(cache_key, parameters)
+        return parameters
+
+    def get_available_parameters_for_sites(
+        self,
+        site_ids: List[str],
+    ) -> List[Dict[str, str]]:
+        """Available series for several sites, in one combined list.
+
+        Batch version of get_available_parameters(). Every dict
+        carries its site_id, so the combined list still says
+        which site each series belongs to.
+        """
+        combined: List[Dict[str, str]] = []
+        for site_id in site_ids:
+            combined.extend(self.get_available_parameters(site_id))
+        return combined
+
+    def available_parameters_dataframe(self, site_ids: List[str]) -> pd.DataFrame:
+        """Available series for one or more sites, as a DataFrame.
+
+        Same list as get_available_parameters_for_sites(), just
+        in the form I actually want for browsing options, saving
+        a catalogue CSV, or (later) showing in a GUI table.
+        """
+        records = self.get_available_parameters_for_sites(site_ids)
+        columns = [
+            "site_id", "code", "name", "unit", "statistic_id",
+            "computation", "begin", "end", "time_series_id",
+            "primary", "description", "sublocation", "web_description",
+        ]
+        if not records:
+            # Still return the columns, so anything using this
+            # doesn't blow up on an empty result.
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame.from_records(records, columns=columns)
+
+    @staticmethod
+    def _feature_to_parameter(feature: Dict[str, Any]) -> Dict[str, str]:
+        """Convert one time-series-metadata feature to a plain dict.
+
+        Everything gets stringified: USGS returns None for some
+        fields (statistic_id on instantaneous series, for one),
+        and I don't want "00060" ever turning into the int 60
+        and losing its leading zeros.
+        """
+        props = feature.get("properties", {})
+
+        def text(key: str) -> str:
+            value = props.get(key)
+            return "" if value is None else str(value)
+
+        return {
+            "site_id": text("monitoring_location_id"),
+            "code": text("parameter_code"),
+            "name": text("parameter_name"),
+            "unit": text("unit_of_measure"),
+            "statistic_id": text("statistic_id"),
+            "computation": text("computation_identifier"),
+            "begin": text("begin"),
+            "end": text("end"),
+            "time_series_id": text("id"),
+            "primary": text("primary"),
+            "description": text("parameter_description"),
+            "sublocation": text("sublocation_identifier"),
+            "web_description": text("web_description"),
+        }
+
+    # ---------------------------------------------------------
+    # TODO: DATA DOWNLOAD (not implemented yet)
+    # ---------------------------------------------------------
+    # Has to exist or BaseDataSource won't let me instantiate
+    # this class at all (abstractmethod). Raising for now --
+    # I'd rather see an error than a fake empty result that
+    # looks like "no data available".
 
     def get_data(
         self,
@@ -609,11 +666,7 @@ class USGSDataSource(BaseDataSource):
         """
         Get time series data.
 
-        PLANNED (Feature 3+): will download selected series
-        (starting with a one-site discharge smoke test) and convert
-        them to standard DataPoint objects.
+        TODO: implement this next. Start with one site / one
+        parameter as a smoke test, then expand from there.
         """
-        raise NotImplementedError(
-            "USGS get_data() is planned as Feature 3 "
-            "and is not implemented yet."
-        )
+        raise NotImplementedError("USGS get_data() is not implemented yet.")
