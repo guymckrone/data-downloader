@@ -12,8 +12,8 @@ Done so far:
     get_data()                 -- download continuous series
 
 TODO:
-    chunking for long records, multi-parameter downloads,
-    "download all series at a site" mode
+    multi-parameter downloads, "download all series at a site"
+    mode
 
 Notes to self:
     - GeoJSON coordinates come back as [longitude, latitude].
@@ -89,6 +89,13 @@ class USGSDataSource(BaseDataSource):
     # Page size for API requests. Just a performance knob, the
     # pagination in _fetch_all_features() handles the rest.
     DEFAULT_PAGE_LIMIT = 1000
+
+    # Default chunk sizes for get_data(). Continuous data is
+    # dense (96 readings/day at 15-minute spacing), so a year
+    # at a time; daily data is one value a day, so ten years
+    # at a time is still a small request.
+    CONTINUOUS_CHUNK_YEARS = 1
+    DAILY_CHUNK_YEARS = 10
 
     # Friendly names I can use in get_data() instead of codes.
     # Codes stay strings -- "00060" as an int loses the zeros.
@@ -684,6 +691,9 @@ class USGSDataSource(BaseDataSource):
     # mean/max/min series. Which one gets used is decided per
     # series in get_data() from its computation_period
     # ("Daily" vs "Points") in the metadata.
+    # Long ranges get split into chunks (see _chunk_ranges) --
+    # same idea as export_full_record() in the Aquarius code,
+    # one modest request at a time instead of one giant one.
     # I'm not caching downloads, they can be huge; the parameter
     # metadata lookup inside here is already cached.
 
@@ -725,6 +735,11 @@ class USGSDataSource(BaseDataSource):
                 are passed.
             sublocation: pick the series at this sublocation
                 (e.g. "Middle WT Sensor").
+            chunk_years: split the date range into chunks of
+                this many years (one request per chunk, stitched
+                back together). Defaults: 1 year for continuous
+                series, 10 for daily. Mostly I leave this alone;
+                it's here for unusually dense/sparse series.
 
         Daily values come back timestamped at midnight UTC on
         their date.
@@ -736,16 +751,23 @@ class USGSDataSource(BaseDataSource):
         computation = kwargs.pop("computation", "Instantaneous")
         statistic_id = kwargs.pop("statistic_id", None)
         sublocation = kwargs.pop("sublocation", None)
+        chunk_years = kwargs.pop("chunk_years", None)
         if kwargs:
             raise ValueError(
                 f"Unsupported get_data() argument(s): {sorted(kwargs)}. "
                 "Supported: time_series_id, computation, "
-                "statistic_id, sublocation"
+                "statistic_id, sublocation, chunk_years"
             )
+        if chunk_years is not None and (
+            not isinstance(chunk_years, int) or chunk_years < 1
+        ):
+            raise ValueError("chunk_years must be a positive integer")
 
         parameter_code = self._resolve_parameter_code(parameter)
-        start_text = self._datetime_to_text(start_date, "start_date")
-        end_text = self._datetime_to_text(end_date, "end_date")
+        start_moment = self._coerce_datetime(start_date, "start_date")
+        end_moment = self._coerce_datetime(end_date, "end_date")
+        if end_moment < start_moment:
+            raise ValueError("end_date is before start_date")
 
         all_points: List[DataPoint] = []
         for site_id in site_ids:
@@ -769,31 +791,55 @@ class USGSDataSource(BaseDataSource):
             else:
                 collection = "continuous"
 
-            features = self._fetch_all_features(
-                params={
-                    "f": "json",
-                    "limit": self.DEFAULT_PAGE_LIMIT,
-                    "monitoring_location_id": normalized,
-                    "time_series_id": series["time_series_id"],
-                    "datetime": f"{start_text}/{end_text}",
-                },
-                collection=collection,
-            )
+            if chunk_years is None:
+                chunk_years = (
+                    self.DAILY_CHUNK_YEARS if collection == "daily"
+                    else self.CONTINUOUS_CHUNK_YEARS
+                )
+
+            ranges = list(self._chunk_ranges(start_moment, end_moment, chunk_years))
+            if len(ranges) > 1:
+                self.logger.info(
+                    f"{normalized} {series['name']}: downloading in "
+                    f"{len(ranges)} chunks of {chunk_years} year(s)"
+                )
 
             points = []
             skipped = 0
-            for feature in features:
-                point = self._feature_to_datapoint(feature, series)
-                if point is None:
-                    skipped += 1
-                else:
-                    points.append(point)
+            for chunk_start, chunk_end in ranges:
+                features = self._fetch_all_features(
+                    params={
+                        "f": "json",
+                        "limit": self.DEFAULT_PAGE_LIMIT,
+                        "monitoring_location_id": normalized,
+                        "time_series_id": series["time_series_id"],
+                        "datetime": (
+                            f"{chunk_start.isoformat()}/{chunk_end.isoformat()}"
+                        ),
+                    },
+                    collection=collection,
+                )
+                for feature in features:
+                    point = self._feature_to_datapoint(feature, series)
+                    if point is None:
+                        skipped += 1
+                    else:
+                        points.append(point)
 
-            points.sort(key=lambda p: p.timestamp)
+            # USGS intervals are closed, so the reading exactly
+            # on a chunk boundary comes back in both chunks.
+            # Dedupe on timestamp (keeping the first copy) rather
+            # than trying to outsmart the interval boundaries.
+            unique = {point.timestamp: point for point in points}
+            duplicates = len(points) - len(unique)
+            points = sorted(unique.values(), key=lambda p: p.timestamp)
+
             self.logger.info(
                 f"{normalized} {series['name']}: {len(points):,} points "
-                f"({start_text[:10]} to {end_text[:10]})"
+                f"({start_moment.date()} to {end_moment.date()})"
                 + (f", {skipped} missing values skipped" if skipped else "")
+                + (f", {duplicates} boundary duplicates dropped"
+                   if duplicates else "")
             )
             all_points.extend(points)
 
@@ -903,10 +949,43 @@ class USGSDataSource(BaseDataSource):
         )
 
     @staticmethod
-    def _datetime_to_text(value, name: str) -> str:
-        """Format a date/datetime/string as ISO text for USGS.
+    def _add_years(moment: datetime, years: int) -> datetime:
+        """Shift a datetime by whole years, Feb 29 safe.
 
-        Naive datetimes get stamped as UTC rather than rejected --
+        datetime.replace(year=...) blows up going from Feb 29 to
+        a non-leap year, so I fall back to Feb 28 there. (Same
+        trick as _add_years in the Aquarius downloader.)
+        """
+        try:
+            return moment.replace(year=moment.year + years)
+        except ValueError:  # Feb 29 -> non-leap target year
+            return moment.replace(year=moment.year + years, day=28)
+
+    @staticmethod
+    def _chunk_ranges(start: datetime, end: datetime, years: int):
+        """Yield (chunk_start, chunk_end) pairs covering start-end.
+
+        The last chunk stops at `end` instead of overshooting
+        it. Chunks share their boundary instant on purpose --
+        get_data() dedupes the duplicate reading that produces,
+        which is simpler than fiddling with interval edges.
+        """
+        if start == end:
+            yield start, end
+            return
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(
+                USGSDataSource._add_years(chunk_start, years), end
+            )
+            yield chunk_start, chunk_end
+            chunk_start = chunk_end
+
+    @staticmethod
+    def _coerce_datetime(value, name: str) -> datetime:
+        """Turn a date/datetime/string into an aware UTC datetime.
+
+        Naive values get stamped as UTC rather than rejected --
         USGS works in UTC anyway, and forcing callers to build
         timezone-aware datetimes for every call is annoying.
         """
@@ -929,7 +1008,12 @@ class USGSDataSource(BaseDataSource):
 
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc).isoformat()
+        return moment.astimezone(timezone.utc)
+
+    @staticmethod
+    def _datetime_to_text(value, name: str) -> str:
+        """Format a date/datetime/string as ISO text for USGS."""
+        return USGSDataSource._coerce_datetime(value, name).isoformat()
 
     @staticmethod
     def _feature_to_datapoint(
@@ -957,11 +1041,15 @@ class USGSDataSource(BaseDataSource):
         # Approval + qualifier both describe data quality, so I
         # keep them together in quality_flag ("Provisional",
         # "Approved", sometimes with qualifier text after a |).
-        quality_parts = [
-            part for part in
-            [props.get("approval_status"), props.get("qualifier")]
-            if part
-        ]
+        # qualifier comes back as a plain string on recent data
+        # but as a list on older daily records, so I flatten
+        # both shapes into individual strings here.
+        quality_parts = []
+        for item in [props.get("approval_status"), props.get("qualifier")]:
+            if isinstance(item, (list, tuple)):
+                quality_parts.extend(str(part) for part in item if part)
+            elif item:
+                quality_parts.append(str(item))
 
         timestamp = datetime.fromisoformat(props["time"])
         if timestamp.tzinfo is None:
