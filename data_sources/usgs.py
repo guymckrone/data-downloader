@@ -12,8 +12,8 @@ Done so far:
     get_data()                 -- download continuous series
 
 TODO:
-    get_data() daily support   -- daily mean/max/min series
-    chunking for long records, multi-parameter downloads
+    chunking for long records, multi-parameter downloads,
+    "download all series at a site" mode
 
 Notes to self:
     - GeoJSON coordinates come back as [longitude, latitude].
@@ -631,6 +631,7 @@ class USGSDataSource(BaseDataSource):
             "site_id", "code", "name", "unit", "statistic_id",
             "computation", "begin", "end", "time_series_id",
             "primary", "description", "sublocation", "web_description",
+            "parent_time_series_id", "computation_period",
         ]
         if not records:
             # Still return the columns, so anything using this
@@ -667,16 +668,24 @@ class USGSDataSource(BaseDataSource):
             "description": text("parameter_description"),
             "sublocation": text("sublocation_identifier"),
             "web_description": text("web_description"),
+            "parent_time_series_id": text("parent_time_series_id"),
+            # "Points" = sub-daily readings, "Daily" = daily
+            # values. This (not parent_time_series_id -- turns
+            # out instantaneous series can have a parent too)
+            # is how I tell which collection a series lives in.
+            "computation_period": text("computation_period_identifier"),
         }
 
     # ---------------------------------------------------------
     # DATA DOWNLOAD
     # ---------------------------------------------------------
-    # For now this only does continuous (sub-daily, usually
-    # 15-minute) instantaneous series. Daily means/max/mins live
-    # in a different USGS collection ("daily") -- that's next.
-    # I'm not caching downloads either, they can be huge; the
-    # parameter metadata lookup inside here is already cached.
+    # Downloads from two USGS collections: "continuous" for
+    # instantaneous (sub-daily) series, "daily" for daily
+    # mean/max/min series. Which one gets used is decided per
+    # series in get_data() from its computation_period
+    # ("Daily" vs "Points") in the metadata.
+    # I'm not caching downloads, they can be huge; the parameter
+    # metadata lookup inside here is already cached.
 
     def get_data(
         self,
@@ -706,28 +715,32 @@ class USGSDataSource(BaseDataSource):
                 for the same parameter -- grab the id from
                 get_available_parameters() and pass it here.
             computation: which computation to pick when a
-                parameter has several. Only "Instantaneous" is
-                supported for now; anything else errors out
-                until daily support lands.
+                parameter has several -- "Instantaneous" (default,
+                sub-daily data), or a daily one like "Mean",
+                "Max", "Min", "Median". Matched against the
+                names in get_available_parameters().
+            statistic_id: same choice by USGS statistic code
+                instead ("00003" = mean, "00001" = max,
+                "00002" = min). Wins over computation if both
+                are passed.
             sublocation: pick the series at this sublocation
                 (e.g. "Middle WT Sensor").
+
+        Daily values come back timestamped at midnight UTC on
+        their date.
 
         returns a list of DataPoint objects, oldest first.
         Use to_dataframe() on it for a pandas DataFrame.
         """
         time_series_id = kwargs.pop("time_series_id", None)
         computation = kwargs.pop("computation", "Instantaneous")
+        statistic_id = kwargs.pop("statistic_id", None)
         sublocation = kwargs.pop("sublocation", None)
         if kwargs:
             raise ValueError(
                 f"Unsupported get_data() argument(s): {sorted(kwargs)}. "
-                "Supported: time_series_id, computation, sublocation"
-            )
-        if computation.lower() != "instantaneous":
-            raise NotImplementedError(
-                f"computation={computation!r} isn't supported yet. "
-                "Only Instantaneous (continuous) series for now; "
-                "daily Mean/Max/Min support is the next step."
+                "Supported: time_series_id, computation, "
+                "statistic_id, sublocation"
             )
 
         parameter_code = self._resolve_parameter_code(parameter)
@@ -741,8 +754,20 @@ class USGSDataSource(BaseDataSource):
                 normalized, parameter_code,
                 time_series_id=time_series_id,
                 computation=computation,
+                statistic_id=statistic_id,
                 sublocation=sublocation,
             )
+
+            # computation_period is the reliable signal here:
+            # "Daily" lives in the daily collection, everything
+            # else ("Points", etc.) in continuous. I originally
+            # routed on parent_time_series_id and that was wrong
+            # -- instantaneous series can have a parent too, and
+            # my discharge test came back empty because of it.
+            if series.get("computation_period", "").lower() == "daily":
+                collection = "daily"
+            else:
+                collection = "continuous"
 
             features = self._fetch_all_features(
                 params={
@@ -752,7 +777,7 @@ class USGSDataSource(BaseDataSource):
                     "time_series_id": series["time_series_id"],
                     "datetime": f"{start_text}/{end_text}",
                 },
-                collection="continuous",
+                collection=collection,
             )
 
             points = []
@@ -781,6 +806,7 @@ class USGSDataSource(BaseDataSource):
         parameter_code: str,
         time_series_id: Optional[str] = None,
         computation: str = "Instantaneous",
+        statistic_id: Optional[str] = None,
         sublocation: Optional[str] = None,
     ) -> Dict[str, str]:
         """Pick the one series a get_data() call should download.
@@ -808,10 +834,20 @@ class USGSDataSource(BaseDataSource):
                 s for s in candidates
                 if s["sublocation"].lower() == sublocation.lower()
             ]
-        candidates = [
-            s for s in candidates
-            if s["computation"].lower() == computation.lower()
-        ]
+        if statistic_id is not None:
+            # Codes again: "3" means "00003" (mean).
+            wanted_statistic = str(statistic_id).strip().zfill(5)
+            candidates = [
+                s for s in candidates
+                if s["statistic_id"] == wanted_statistic
+            ]
+            wanted = f"statistic {wanted_statistic}"
+        else:
+            candidates = [
+                s for s in candidates
+                if s["computation"].lower() == computation.lower()
+            ]
+            wanted = computation
 
         if not candidates:
             offered = sorted({
@@ -821,7 +857,7 @@ class USGSDataSource(BaseDataSource):
                 for s in available if s["code"] == parameter_code
             })
             raise ValueError(
-                f"No {computation} series for parameter "
+                f"No {wanted} series for parameter "
                 f"{parameter_code} at {site_id}."
                 + (f" Available for this parameter: {offered}"
                    if offered else
@@ -900,7 +936,7 @@ class USGSDataSource(BaseDataSource):
         feature: Dict[str, Any],
         series: Dict[str, str],
     ) -> Optional[DataPoint]:
-        """Convert one continuous-data feature to a DataPoint.
+        """Convert one continuous/daily feature to a DataPoint.
 
         Returns None for missing readings so the caller can count
         and skip them. USGS uses nulls now, but I check for the
@@ -927,12 +963,27 @@ class USGSDataSource(BaseDataSource):
             if part
         ]
 
+        timestamp = datetime.fromisoformat(props["time"])
+        if timestamp.tzinfo is None:
+            # Daily values come back as bare dates ("2026-10-14")
+            # with no timezone. Calling them midnight UTC keeps
+            # them comparable with the continuous timestamps
+            # instead of mixing naive and aware datetimes.
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        # Daily series get their computation in the label
+        # ("Discharge (Mean)") so a daily mean can't get mixed
+        # up with instantaneous discharge in the same DataFrame.
+        parameter_label = series.get("name") or props.get("parameter_code", "")
+        computation = series.get("computation", "")
+        if computation and computation.lower() != "instantaneous":
+            parameter_label = f"{parameter_label} ({computation})"
+
         return DataPoint(
-            timestamp=datetime.fromisoformat(props["time"]),
+            timestamp=timestamp,
             value=value,
             location_id=props.get("monitoring_location_id", ""),
-            # Series name ("Discharge"), falling back to the code.
-            parameter=series.get("name") or props.get("parameter_code", ""),
+            parameter=parameter_label,
             unit=props.get("unit_of_measure") or series.get("unit", ""),
             source="USGS",
             quality_flag="|".join(quality_parts) if quality_parts else None,
