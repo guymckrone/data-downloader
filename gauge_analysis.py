@@ -315,12 +315,9 @@ def main():
     save_results(summary, OUTPUT_DIR)
     logger.info("Analysis complete!")
 
-    # Below calls are useful to analyzing data gaps
-    """investigate_data_quality(rain_df)
-    investigate_yearly_pattern(rain_df, "HYDRA-4")
-    investigate_hourly_pattern(rain_df, "HYDRA-4")
-    investigate_minute_pattern(rain_df, "HYDRA-4")
-    investigate_gauge_timing(rain_df)
-"""
+    # The investigate_* functions above are my data-gap toolkit --
+    # I run those by hand from a notebook/console when I need them,
+    # they're not part of the normal main() run.
+
 if __name__ == "__main__":
     main()

@@ -329,7 +329,6 @@ def snotel_extra_edges():
 # CROSS-SOURCE
 # =========================================================
 def cross_source_dataframe_shape():
-    from data_sources.base import DataPoint
     empty = usgs.to_dataframe([])
     assert empty.empty
     frames = [
