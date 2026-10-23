@@ -1,0 +1,4 @@
+# Extra deps for the Streamlit GUI (Step 2+).
+# Install into the same conda env the downloader already uses:
+#   pip install -r requirements-gui.txt
+streamlit>=1.28
