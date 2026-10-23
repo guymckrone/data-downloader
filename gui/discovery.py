@@ -16,21 +16,26 @@ from data_sources import BaseDataSource, SiteInfo
 def sites_to_dataframe(sites: List[SiteInfo]) -> pd.DataFrame:
     """Flatten SiteInfo rows into a table for st.dataframe.
 
-    I skip the metadata dict -- it's source-specific clutter
-    and the core columns are what I want to browse.
+    Pull agency_code / site_type out of metadata when present
+    -- for USGS, OR004-* sites are real locations but often
+    have zero downloadable series, and that column makes it
+    obvious why parameters came back empty.
     """
+    columns = [
+        "site_id", "name", "agency_code", "site_type",
+        "latitude", "longitude", "state", "county",
+        "elevation_ft", "source",
+    ]
     if not sites:
-        return pd.DataFrame(
-            columns=[
-                "site_id", "name", "latitude", "longitude",
-                "state", "county", "elevation_ft", "source",
-            ]
-        )
+        return pd.DataFrame(columns=columns)
     return pd.DataFrame(
         [
             {
                 "site_id": s.site_id,
                 "name": s.name,
+                "agency_code": (s.metadata or {}).get("agency_code"),
+                "site_type": (s.metadata or {}).get("site_type")
+                or (s.metadata or {}).get("site_type_code"),
                 "latitude": s.latitude,
                 "longitude": s.longitude,
                 "state": s.state,
@@ -39,7 +44,8 @@ def sites_to_dataframe(sites: List[SiteInfo]) -> pd.DataFrame:
                 "source": s.source,
             }
             for s in sites
-        ]
+        ],
+        columns=columns,
     )
 
 
@@ -61,7 +67,11 @@ def parse_site_ids(raw: str) -> Optional[List[str]]:
 
 
 def clear_discovery_state() -> None:
-    """Drop cached discovery results (call when source changes)."""
+    """Drop cached discovery results (call when source changes).
+
+    Also clears download results -- they were built from the
+    old parameters catalogue.
+    """
     for key in (
         "discovery_sites",
         "discovery_sites_df",
@@ -69,6 +79,11 @@ def clear_discovery_state() -> None:
         "discovery_error",
     ):
         st.session_state.pop(key, None)
+    # Local import avoids a circular import at module load
+    # (download.py doesn't import discovery today, but I don't
+    # want a future one to bite me).
+    from gui.download import clear_download_state
+    clear_download_state()
 
 
 def render_discovery(source: BaseDataSource, source_key: str) -> None:
@@ -76,7 +91,7 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
     st.header("Discovery")
     st.caption(
         "Find sites, then inspect what each one measures. "
-        "Downloads come later (Step 4)."
+        "Use the parameters table below to pick downloads."
     )
 
     # ---- filters ----
@@ -106,11 +121,38 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
             ),
         )
 
+    # USGS-only discovery kwargs (passed straight into get_sites)
+    agency_code = ""
+    site_type_code = ""
     if source_key == "usgs":
+        col_agency, col_type = st.columns(2)
+        with col_agency:
+            # Default USGS: a bare OR pull mixes in OR004/etc.
+            # agency locations that often have zero series in the
+            # continuous/daily API -- looks like a bug in the GUI.
+            agency_code = st.text_input(
+                "Agency code",
+                value="USGS",
+                key=f"discovery_agency_{source_key}",
+                help=(
+                    "USGS = federal gages with downloadable series. "
+                    "Clear this to include other agencies (OR004, …). "
+                    "Many non-USGS locations have no time series here."
+                ),
+            )
+        with col_type:
+            site_type_code = st.text_input(
+                "Site type code",
+                value="ST",
+                key=f"discovery_site_type_{source_key}",
+                help=(
+                    "ST = stream. Clear for all types. "
+                    "See USGS site-type codes for others."
+                ),
+            )
         st.caption(
-            "Tip: Johnson Creek test site is 14211400. "
-            "A bare state='OR' pull can be ~5k–19k locations "
-            "and spends API quota."
+            "Tip: Johnson Creek is 14211400. "
+            "OR004-* ids are other agencies — often no parameters."
         )
     elif source_key == "snotel":
         st.caption(
@@ -138,18 +180,27 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
             )
         else:
             st.session_state.pop("discovery_error", None)
+            site_kwargs = {}
+            if source_key == "usgs":
+                if agency_code.strip():
+                    site_kwargs["agency_code"] = agency_code.strip()
+                if site_type_code.strip():
+                    site_kwargs["site_type_code"] = site_type_code.strip()
             try:
                 with st.spinner("Calling get_sites()..."):
                     sites = source.get_sites(
                         state=state_arg,
                         site_ids=ids_arg,
+                        **site_kwargs,
                     )
                 st.session_state["discovery_sites"] = sites
                 st.session_state["discovery_sites_df"] = sites_to_dataframe(
                     sites
                 )
-                # New site list invalidates the old parameters table
+                # New site list invalidates params + any download
                 st.session_state.pop("discovery_params_df", None)
+                from gui.download import clear_download_state
+                clear_download_state()
             except Exception as exc:
                 clear_discovery_state()
                 st.session_state["discovery_error"] = f"{type(exc).__name__}: {exc}"
@@ -197,6 +248,8 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
                 with st.spinner("Calling available_parameters_dataframe()..."):
                     params_df = source.available_parameters_dataframe(selected)
                 st.session_state["discovery_params_df"] = params_df
+                from gui.download import clear_download_state
+                clear_download_state()
             except Exception as exc:
                 st.session_state.pop("discovery_params_df", None)
                 st.error(f"{type(exc).__name__}: {exc}")
@@ -206,4 +259,14 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
         st.caption(f"{len(params_df):,} series/element/dataset row(s)")
         st.dataframe(params_df, use_container_width=True, hide_index=True)
         if params_df.empty:
-            st.warning("No parameters returned for the selected site(s).")
+            if source_key == "usgs":
+                st.warning(
+                    "No time series in the USGS continuous/daily API "
+                    "for the selected site(s). That is a real empty "
+                    "answer (not a GUI bug) — common for non-USGS "
+                    "agency ids like OR004-… or discontinued sites. "
+                    "Re-find with Agency code **USGS**, or try site "
+                    "id **14211400** (Johnson Creek)."
+                )
+            else:
+                st.warning("No parameters returned for the selected site(s).")

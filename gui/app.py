@@ -8,7 +8,7 @@ Steps so far:
     1. Registry-backed source picker
     2. Source-specific sidebar options
     3. Discovery: sites table + available-parameters table
-       (button-driven; no downloads yet)
+    4. Download: series pick, date range, get_data, CSV
 
 Install once (same conda env as the downloader):
     pip install -r requirements-gui.txt
@@ -28,13 +28,15 @@ import streamlit as st
 
 from data_sources import create_source, get_descriptor, list_sources
 from gui.discovery import clear_discovery_state, render_discovery
+from gui.download import render_download
 from gui.widgets import render_source_options
 
 
 def _constructor_kwargs(source_key: str, option_values: dict) -> dict:
     """Pick option values that create_source actually understands.
 
-    duration stays GUI-only until downloads (Step 4).
+    SNOTEL duration is per catalogue row at download time, so
+    the sidebar duration option is informational for now.
     """
     kwargs = {}
     if source_key in ("aquarius", "snotel") and "verify_ssl" in option_values:
@@ -99,8 +101,11 @@ def main() -> None:
     st.write(descriptor.description)
 
     render_discovery(source, selected_key)
+    st.divider()
+    render_download(source, selected_key)
 
     with st.expander("Session status (debug)", expanded=False):
+        download_df = st.session_state.get("download_df")
         st.write(
             {
                 "registry_key": selected_key,
@@ -109,6 +114,9 @@ def main() -> None:
                 "option_values": option_values,
                 "sites_loaded": len(
                     st.session_state.get("discovery_sites") or []
+                ),
+                "download_rows": (
+                    0 if download_df is None else len(download_df)
                 ),
             }
         )
