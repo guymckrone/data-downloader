@@ -12,11 +12,18 @@ Exports (from the shared to_dataframe() columns):
     .db  -- SQLite file with an `observations` table (same
             columns). Readable later with sqlite3 / pandas
             read_sql, same idea as the Aquarius precip DBs.
+
+Layout:
+    One file     -- all selected series stacked (current default)
+    One per series -- a ZIP with one csv/.db per timeseries
 """
 
+import io
 import os
+import re
 import sqlite3
 import tempfile
+import zipfile
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List
 
@@ -65,10 +72,70 @@ def clear_download_state() -> None:
     """Drop cached download results."""
     for key in (
         "download_df",
+        "download_parts",
         "download_error",
         "download_meta",
     ):
         st.session_state.pop(key, None)
+
+
+def _safe_stem(text: str, max_len: int = 80) -> str:
+    """Turn a label into a filesystem-safe filename piece."""
+    cleaned = re.sub(r"[^\w.\-]+", "_", str(text).strip())
+    cleaned = cleaned.strip("._") or "series"
+    return cleaned[:max_len]
+
+
+def _part_stem(row: pd.Series, source_key: str) -> str:
+    """Filename stem for one timeseries (no extension)."""
+    site = str(row.get("site_id") or "site")
+    code = str(row.get("code") or "param")
+    if source_key == "usgs":
+        tid = str(row.get("time_series_id") or "")[:8]
+        comp = str(row.get("computation") or "")
+        return _safe_stem(f"{site}_{code}_{comp}_{tid}")
+    if source_key == "aquarius":
+        ident = str(
+            row.get("dataset_identifier") or row.get("code") or "dataset"
+        )
+        return _safe_stem(ident.replace("@", "_at_"))
+    dur = str(row.get("duration") or "")
+    ord_ = str(row.get("ordinal") or "")
+    depth = str(row.get("height_depth") or "")
+    return _safe_stem(f"{site}_{code}_{dur}_ord{ord_}_{depth}")
+
+
+def _unique_stems(stems: List[str]) -> List[str]:
+    """If two series collide on a name, append _2, _3, ..."""
+    seen: Dict[str, int] = {}
+    unique: List[str] = []
+    for stem in stems:
+        count = seen.get(stem, 0) + 1
+        seen[stem] = count
+        unique.append(stem if count == 1 else f"{stem}_{count}")
+    return unique
+
+
+def parts_to_zip(
+    parts: List[Dict[str, Any]],
+    fmt: str,
+) -> bytes:
+    """ZIP of one csv or .db per part. fmt is 'csv' or 'db'."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for part in parts:
+            stem = part["stem"]
+            part_df: pd.DataFrame = part["df"]
+            if fmt == "csv":
+                zf.writestr(
+                    f"{stem}.csv",
+                    part_df.to_csv(index=False).encode("utf-8"),
+                )
+            elif fmt == "db":
+                zf.writestr(f"{stem}.db", dataframe_to_sqlite_bytes(part_df))
+            else:
+                raise ValueError(f"Unknown zip format: {fmt!r}")
+    return buf.getvalue()
 
 
 def _series_key(row: pd.Series, source_key: str) -> str:
@@ -254,6 +321,8 @@ def render_download(
         else:
             st.session_state.pop("download_error", None)
             all_points: List[Any] = []
+            parts: List[Dict[str, Any]] = []
+            raw_stems: List[str] = []
             errors: List[str] = []
             n = len(selected_keys)
             bar = st.progress(0)
@@ -268,6 +337,15 @@ def render_download(
                     points = _get_data_for_row(
                         source, source_key, row, start, end
                     )
+                    part_df = source.to_dataframe(points)
+                    parts.append(
+                        {
+                            "stem": _part_stem(row, source_key),
+                            "label": labels.get(key, key),
+                            "df": part_df,
+                        }
+                    )
+                    raw_stems.append(parts[-1]["stem"])
                     all_points.extend(points)
                 except Exception as exc:
                     errors.append(
@@ -279,15 +357,21 @@ def render_download(
             status.empty()
             bar.empty()
 
-            if errors and not all_points:
+            if errors and not parts:
                 st.session_state["download_df"] = None
+                st.session_state["download_parts"] = None
                 st.session_state["download_error"] = "\n".join(errors)
                 st.session_state["download_meta"] = None
             else:
+                # Dedupe stems so two similar series don't clobber
+                # each other inside a per-series ZIP.
+                for part, stem in zip(parts, _unique_stems(raw_stems)):
+                    part["stem"] = stem
                 df = source.to_dataframe(all_points)
                 st.session_state["download_df"] = df
+                st.session_state["download_parts"] = parts
                 st.session_state["download_meta"] = {
-                    "series_count": n,
+                    "series_count": len(parts),
                     "point_count": len(all_points),
                     "start": str(start),
                     "end": str(end),
@@ -306,6 +390,7 @@ def render_download(
         st.error(err)
 
     df = st.session_state.get("download_df")
+    parts = st.session_state.get("download_parts") or []
     meta = st.session_state.get("download_meta")
     if df is None:
         return
@@ -319,7 +404,7 @@ def render_download(
 
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    if df.empty:
+    if df.empty and not parts:
         st.warning("Download returned no points for that range.")
         return
 
@@ -329,26 +414,72 @@ def render_download(
     )
 
     st.subheader("Save")
-    st.caption(
-        "Same data, two formats. SQLite table name is "
-        "`observations` (columns match the table above)."
+    layout = st.radio(
+        "File layout",
+        options=["combined", "per_series"],
+        format_func=lambda v: (
+            "One file (all series together)"
+            if v == "combined"
+            else "One file per timeseries (ZIP)"
+        ),
+        horizontal=True,
+        key=f"download_layout_{source_key}",
+        help=(
+            "Combined stacks every series into one csv/.db. "
+            "Per timeseries puts each series in its own file "
+            "inside a ZIP (browsers only let me hand you one "
+            "download at a time)."
+        ),
     )
-    col_csv, col_db = st.columns(2)
-    with col_csv:
-        st.download_button(
-            label="Save CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{base_name}.csv",
-            mime="text/csv",
-            key=f"download_csv_{source_key}",
-            use_container_width=True,
+
+    if layout == "combined":
+        st.caption(
+            "SQLite table name is `observations` "
+            "(columns match the preview table)."
         )
-    with col_db:
-        st.download_button(
-            label="Save SQLite (.db)",
-            data=dataframe_to_sqlite_bytes(df),
-            file_name=f"{base_name}.db",
-            mime="application/x-sqlite3",
-            key=f"download_db_{source_key}",
-            use_container_width=True,
+        col_csv, col_db = st.columns(2)
+        with col_csv:
+            st.download_button(
+                label="Save CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{base_name}.csv",
+                mime="text/csv",
+                key=f"download_csv_{source_key}",
+                use_container_width=True,
+            )
+        with col_db:
+            st.download_button(
+                label="Save SQLite (.db)",
+                data=dataframe_to_sqlite_bytes(df),
+                file_name=f"{base_name}.db",
+                mime="application/x-sqlite3",
+                key=f"download_db_{source_key}",
+                use_container_width=True,
+            )
+    else:
+        if not parts:
+            st.warning("No per-series parts to pack into a ZIP.")
+            return
+        st.caption(
+            f"ZIP will contain {len(parts)} file(s). "
+            "Each SQLite file has an `observations` table."
         )
+        col_csv, col_db = st.columns(2)
+        with col_csv:
+            st.download_button(
+                label="Save CSV (ZIP)",
+                data=parts_to_zip(parts, "csv"),
+                file_name=f"{base_name}_csv.zip",
+                mime="application/zip",
+                key=f"download_csv_zip_{source_key}",
+                use_container_width=True,
+            )
+        with col_db:
+            st.download_button(
+                label="Save SQLite (ZIP)",
+                data=parts_to_zip(parts, "db"),
+                file_name=f"{base_name}_db.zip",
+                mime="application/zip",
+                key=f"download_db_zip_{source_key}",
+                use_container_width=True,
+            )
