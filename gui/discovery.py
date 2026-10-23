@@ -9,12 +9,14 @@ extra API calls. Same filters work for every source.
 """
 
 import hashlib
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from data_sources import BaseDataSource, SiteInfo
+
+BBox = Tuple[float, float, float, float]
 
 
 def sites_to_dataframe(sites: List[SiteInfo]) -> pd.DataFrame:
@@ -151,6 +153,8 @@ def clear_discovery_state() -> None:
             or key.startswith("discovery_full_sig_")
             or key.startswith("map_click_token_")
             or key.startswith("sites_map_")
+            or key.startswith("bbox_draw_map_")
+            or key.startswith("drawn_bbox_")
         ):
             st.session_state.pop(key, None)
     # Local import avoids a circular import at module load
@@ -158,6 +162,55 @@ def clear_discovery_state() -> None:
     # want a future one to bite me).
     from gui.download import clear_download_state
     clear_download_state()
+
+
+def _usgs_site_kwargs(agency_code: str, site_type_code: str) -> dict:
+    """Optional kwargs for USGS get_sites()."""
+    kwargs = {}
+    if agency_code.strip():
+        kwargs["agency_code"] = agency_code.strip()
+    if site_type_code.strip():
+        kwargs["site_type_code"] = site_type_code.strip()
+    return kwargs
+
+
+def _store_discovered_sites(sites: List[SiteInfo]) -> None:
+    """Write a fresh get_sites() result into session_state."""
+    st.session_state["discovery_sites"] = sites
+    st.session_state["discovery_sites_df"] = sites_to_dataframe(sites)
+    st.session_state.pop("discovery_params_df", None)
+    st.session_state.pop("discovery_error", None)
+    from gui.download import clear_download_state
+    clear_download_state()
+
+
+def _run_get_sites(
+    source: BaseDataSource,
+    source_key: str,
+    *,
+    state: Optional[str],
+    site_ids: Optional[List[str]],
+    agency_code: str,
+    site_type_code: str,
+    bbox: Optional[BBox] = None,
+) -> None:
+    """Call get_sites and store results, or set discovery_error."""
+    site_kwargs = {}
+    if source_key == "usgs":
+        site_kwargs.update(_usgs_site_kwargs(agency_code, site_type_code))
+    try:
+        label = "get_sites(bbox=...)" if bbox is not None else "get_sites()"
+        with st.spinner(f"Calling {label}..."):
+            sites = source.get_sites(
+                state=state,
+                site_ids=site_ids,
+                bbox=bbox,
+                **site_kwargs,
+            )
+        _store_discovered_sites(sites)
+    except Exception as exc:
+        clear_discovery_state()
+        st.session_state["discovery_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def render_discovery(source: BaseDataSource, source_key: str) -> None:
@@ -241,44 +294,66 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
             "datasets have no map pin."
         )
 
+    state_arg = state.strip() or None
+    ids_arg = parse_site_ids(site_ids_raw)
+
     find = st.button("Find sites", type="primary", key=f"find_{source_key}")
 
     if find:
-        state_arg = state.strip() or None
-        ids_arg = parse_site_ids(site_ids_raw)
-
         if source_key in ("usgs", "snotel") and not state_arg and not ids_arg:
             clear_discovery_state()
             st.session_state["discovery_error"] = (
                 "Give a state and/or site IDs first — "
-                "an unfiltered pull is huge/slow for this source."
+                "an unfiltered pull is huge/slow for this source. "
+                "Or draw a box below and use Find sites in box."
             )
         else:
-            st.session_state.pop("discovery_error", None)
-            site_kwargs = {}
-            if source_key == "usgs":
-                if agency_code.strip():
-                    site_kwargs["agency_code"] = agency_code.strip()
-                if site_type_code.strip():
-                    site_kwargs["site_type_code"] = site_type_code.strip()
-            try:
-                with st.spinner("Calling get_sites()..."):
-                    sites = source.get_sites(
-                        state=state_arg,
-                        site_ids=ids_arg,
-                        **site_kwargs,
-                    )
-                st.session_state["discovery_sites"] = sites
-                st.session_state["discovery_sites_df"] = sites_to_dataframe(
-                    sites
+            _run_get_sites(
+                source,
+                source_key,
+                state=state_arg,
+                site_ids=ids_arg,
+                agency_code=agency_code,
+                site_type_code=site_type_code,
+                bbox=None,
+            )
+
+    # ---- 5c: draw bbox -> get_sites(bbox=...) ----
+    with st.expander("Find by map area (draw a box)", expanded=False):
+        from gui.map_view import render_bbox_draw_map
+        drawn_bbox = render_bbox_draw_map(source_key)
+        find_box = st.button(
+            "Find sites in box",
+            key=f"find_bbox_{source_key}",
+        )
+        if find_box:
+            bbox = drawn_bbox or st.session_state.get(
+                f"drawn_bbox_{source_key}"
+            )
+            if not bbox:
+                st.session_state["discovery_error"] = (
+                    "Draw a rectangle on the map first, then click "
+                    "Find sites in box."
                 )
-                # New site list invalidates params + any download
-                st.session_state.pop("discovery_params_df", None)
-                from gui.download import clear_download_state
-                clear_download_state()
-            except Exception as exc:
-                clear_discovery_state()
-                st.session_state["discovery_error"] = f"{type(exc).__name__}: {exc}"
+            elif source_key == "snotel" and not state_arg:
+                st.session_state["discovery_error"] = (
+                    "SNOTEL bbox search still needs a State above "
+                    "(e.g. OR) so it doesn't pull every station "
+                    "nationwide before filtering."
+                )
+            else:
+                # Site IDs don't apply to a box search -- bbox is
+                # the spatial filter. State still helps SNOTEL /
+                # Aquarius; USGS can query on bbox alone.
+                _run_get_sites(
+                    source,
+                    source_key,
+                    state=state_arg,
+                    site_ids=None,
+                    agency_code=agency_code,
+                    site_type_code=site_type_code,
+                    bbox=bbox,
+                )
 
     err = st.session_state.get("discovery_error")
     if err:
@@ -288,7 +363,10 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
     sites_df = st.session_state.get("discovery_sites_df")
 
     if sites_df is None:
-        st.info("Click **Find sites** to load a table.")
+        st.info(
+            "Click **Find sites** (filters above) or "
+            "**Find sites in box** (draw a rectangle) to load a table."
+        )
         return
 
     # ---- post-filters (in-memory; no extra API calls) ----

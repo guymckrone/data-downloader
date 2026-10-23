@@ -1,18 +1,19 @@
-"""Map view for discovered sites (Steps 5a / 5b).
+"""Map view for discovered sites (Steps 5a / 5b / 5c).
 
 5a: Folium pins in a MarkerCluster (zoom/click cluster to expand).
 5b: Click a pin -> that site_id is added to the discovery
     multiselect (via session_state).
+5c: Separate draw map -- rectangle -> bbox for get_sites().
 
 Sites missing coordinates are skipped (Aquarius can have
 locations with no map pin -- expected).
 """
 
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import folium
 import streamlit as st
-from folium.plugins import MarkerCluster
+from folium.plugins import Draw, MarkerCluster
 from streamlit_folium import st_folium
 
 from data_sources import SiteInfo
@@ -25,6 +26,9 @@ SOURCE_COLORS: Dict[str, str] = {
 }
 _DEFAULT_COLOR = "#7f7f7f"
 _DEFAULT_ZOOM = 6
+
+# Oregon-ish center for the empty draw-to-search map
+_DRAW_MAP_CENTER = (44.0, -120.5)
 
 # How close a click must be to a pin (degrees) to count as
 # that site. Streamlit-folium usually returns the marker's
@@ -229,3 +233,136 @@ def render_sites_map(
         return None
     st.session_state[token_key] = token
     return site_id
+
+
+# ---------------------------------------------------------
+# 5c — draw a bounding box
+# ---------------------------------------------------------
+
+def build_draw_map() -> folium.Map:
+    """Empty map with rectangle-draw only (no site pins)."""
+    fmap = folium.Map(
+        location=_DRAW_MAP_CENTER,
+        zoom_start=_DEFAULT_ZOOM,
+    )
+    Draw(
+        export=False,
+        position="topleft",
+        draw_options={
+            "polyline": False,
+            "polygon": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "rectangle": True,
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(fmap)
+    return fmap
+
+
+def bbox_from_feature(
+    feature: Any,
+) -> Optional[Tuple[float, float, float, float]]:
+    """GeoJSON feature -> (min_lon, min_lat, max_lon, max_lat).
+
+    Folium Draw rectangles come back as Polygon coordinates
+    in [lon, lat] order.
+    """
+    if not isinstance(feature, dict):
+        return None
+    geom = feature.get("geometry") or {}
+    gtype = geom.get("type")
+    coords = geom.get("coordinates")
+    if not coords:
+        return None
+
+    points: List[Tuple[float, float]] = []
+    if gtype == "Polygon":
+        # coords = [ ring, ... ] ; ring = [ [lon, lat], ... ]
+        ring = coords[0] if coords else []
+        for pt in ring:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                points.append((float(pt[0]), float(pt[1])))
+    elif gtype == "Rectangle":
+        # Some payloads use this; treat like a ring if present
+        for pt in coords:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                points.append((float(pt[0]), float(pt[1])))
+    else:
+        return None
+
+    if not points:
+        return None
+    lons = [p[0] for p in points]
+    lats = [p[1] for p in points]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    if min_lon == max_lon or min_lat == max_lat:
+        return None
+    return (min_lon, min_lat, max_lon, max_lat)
+
+
+def bbox_from_map_data(
+    map_data: Optional[dict],
+) -> Optional[Tuple[float, float, float, float]]:
+    """Pull a bbox out of st_folium draw return values.
+
+    Prefers last_active_drawing, else the last entry in
+    all_drawings.
+    """
+    if not map_data:
+        return None
+    feature = map_data.get("last_active_drawing")
+    bbox = bbox_from_feature(feature)
+    if bbox is not None:
+        return bbox
+    drawings = map_data.get("all_drawings") or []
+    if not drawings:
+        return None
+    return bbox_from_feature(drawings[-1])
+
+
+def render_bbox_draw_map(source_key: str) -> Optional[Tuple[float, float, float, float]]:
+    """Show the draw map; stash + return the current rectangle bbox.
+
+    Returns the bbox if one is drawn (and stores it on
+    session_state so the Find-in-box button still sees it
+    on the next click).
+    """
+    st.markdown("**Find by map area**")
+    st.caption(
+        "Use the rectangle tool (top-left of the map), draw a "
+        "box, then click **Find sites in box**. Uses the same "
+        "agency / site-type filters as above when set. "
+        "State is still used for SNOTEL (keeps the pull small)."
+    )
+
+    fmap = build_draw_map()
+    map_data = st_folium(
+        fmap,
+        key=f"bbox_draw_map_{source_key}",
+        height=360,
+        use_container_width=True,
+        returned_objects=["all_drawings", "last_active_drawing"],
+    )
+
+    bbox = bbox_from_map_data(map_data if isinstance(map_data, dict) else None)
+    bbox_key = f"drawn_bbox_{source_key}"
+    if bbox is not None:
+        st.session_state[bbox_key] = bbox
+    else:
+        # Keep the last good box if the widget returned empty
+        # this run (can happen depending on interaction order).
+        bbox = st.session_state.get(bbox_key)
+
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        st.caption(
+            f"Current box: lon {min_lon:.4f}…{max_lon:.4f}, "
+            f"lat {min_lat:.4f}…{max_lat:.4f}"
+        )
+    else:
+        st.caption("No rectangle drawn yet.")
+
+    return bbox

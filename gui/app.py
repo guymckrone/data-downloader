@@ -9,7 +9,9 @@ Steps so far:
     2. Source-specific sidebar options
     3. Discovery: sites table + available-parameters table
     4. Download: series pick, date range, get_data, CSV/SQLite
-    5a. Map pins for discovered sites (folium)
+    5a. Map pins for discovered sites (folium, clustered)
+    5b. Click a map pin to add it to Sites to inspect
+    5c. Draw a bbox on the map to find sites
 
 Install once (same conda env as the downloader):
     pip install -r requirements-gui.txt
