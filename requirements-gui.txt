@@ -1,4 +1,10 @@
 # Extra deps for the Streamlit GUI (Step 2+).
-# Install into the same conda env the downloader already uses:
+# Install into the same conda env you use to run streamlit:
 #   pip install -r requirements-gui.txt
+# Aquarius pulls config.py, which needs python-dotenv -- if
+# streamlit is on base miniforge instead of the datadownload
+# env, dotenv is the usual missing piece.
 streamlit>=1.28
+python-dotenv>=1.0
+folium>=0.15
+streamlit-folium>=0.20

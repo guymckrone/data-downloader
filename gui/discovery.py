@@ -223,6 +223,10 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
         st.warning("No sites matched those filters.")
         return
 
+    # ---- map (Step 5a: pins only) ----
+    from gui.map_view import render_sites_map
+    render_sites_map(sites, source_key)
+
     # ---- parameters for selected site(s) ----
     st.subheader("Available parameters")
     id_list = [s.site_id for s in sites]
