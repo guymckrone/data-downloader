@@ -1,11 +1,15 @@
 """Discovery UI: find sites, then list available parameters.
 
-Read-only for Step 3 -- no downloads. I only hit the APIs
-when the user clicks a button, so Streamlit reruns (every
-checkbox tick) don't burn USGS quota or re-pull SNOTEL.
+I only hit the APIs when the user clicks a button, so
+Streamlit reruns don't burn USGS quota or re-pull SNOTEL.
+
+After Find sites, include / exclude / search filters narrow
+the loaded list in-memory (table + map + site picker) -- no
+extra API calls. Same filters work for every source.
 """
 
-from typing import List, Optional
+import hashlib
+from typing import List, Optional, Sequence
 
 import pandas as pd
 import streamlit as st
@@ -66,11 +70,71 @@ def parse_site_ids(raw: str) -> Optional[List[str]]:
     return parts or None
 
 
+def parse_patterns(raw: str) -> List[str]:
+    """Split include/exclude text into substrings.
+
+    Comma or newline separated so a pattern can contain spaces
+    ("Johnson Creek"). Empty / whitespace-only -> [].
+    """
+    if not raw or not raw.strip():
+        return []
+    parts: List[str] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        token = chunk.strip()
+        if token:
+            parts.append(token)
+    return parts
+
+
+def _site_haystack(site: SiteInfo, match_on: str) -> str:
+    """Text we match include/exclude/search against."""
+    sid = (site.site_id or "").lower()
+    name = (site.name or "").lower()
+    if match_on == "id":
+        return sid
+    if match_on == "name":
+        return name
+    return f"{sid} {name}"
+
+
+def filter_sites(
+    sites: Sequence[SiteInfo],
+    include: Sequence[str],
+    exclude: Sequence[str],
+    search: str = "",
+    match_on: str = "id_or_name",
+) -> List[SiteInfo]:
+    """Narrow a loaded site list in memory (no API calls).
+
+    include: if non-empty, keep sites matching ANY pattern
+    exclude: drop sites matching ANY pattern (after include)
+    search: extra live "contains" filter (AND)
+    match_on: "id" | "name" | "id_or_name"
+    Patterns are case-insensitive substrings.
+    """
+    include_l = [p.lower() for p in include]
+    exclude_l = [p.lower() for p in exclude]
+    search_l = (search or "").strip().lower()
+
+    out: List[SiteInfo] = []
+    for site in sites:
+        text = _site_haystack(site, match_on)
+        if include_l and not any(p in text for p in include_l):
+            continue
+        if exclude_l and any(p in text for p in exclude_l):
+            continue
+        if search_l and search_l not in text:
+            continue
+        out.append(site)
+    return out
+
+
 def clear_discovery_state() -> None:
     """Drop cached discovery results (call when source changes).
 
     Also clears download results -- they were built from the
-    old parameters catalogue.
+    old parameters catalogue -- and map/multiselect session
+    keys so a stale pin-click doesn't re-select old ids.
     """
     for key in (
         "discovery_sites",
@@ -79,6 +143,16 @@ def clear_discovery_state() -> None:
         "discovery_error",
     ):
         st.session_state.pop(key, None)
+    # Widget / map keys are per source_key -- wipe any of them.
+    for key in list(st.session_state.keys()):
+        if (
+            key.startswith("discovery_select_")
+            or key.startswith("discovery_ids_sig_")
+            or key.startswith("discovery_full_sig_")
+            or key.startswith("map_click_token_")
+            or key.startswith("sites_map_")
+        ):
+            st.session_state.pop(key, None)
     # Local import avoids a circular import at module load
     # (download.py doesn't import discovery today, but I don't
     # want a future one to bite me).
@@ -162,8 +236,9 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
     elif source_key == "aquarius":
         st.caption(
             "Tip: HYDRA-1 is a good precip test location. "
-            "Portal is Portland-only; state other than OR "
-            "returns nothing. Some datasets have no map pin."
+            "After Find sites, use Include=`HYDRA` to keep only "
+            "Hydra gauges. Portal is Portland-only; some "
+            "datasets have no map pin."
         )
 
     find = st.button("Find sites", type="primary", key=f"find_{source_key}")
@@ -209,36 +284,151 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
     if err:
         st.error(err)
 
+    all_sites: List[SiteInfo] = st.session_state.get("discovery_sites") or []
     sites_df = st.session_state.get("discovery_sites_df")
-    sites: List[SiteInfo] = st.session_state.get("discovery_sites") or []
 
     if sites_df is None:
         st.info("Click **Find sites** to load a table.")
         return
 
-    st.subheader(f"Sites ({len(sites_df):,})")
-    st.dataframe(sites_df, use_container_width=True, hide_index=True)
+    # ---- post-filters (in-memory; no extra API calls) ----
+    st.subheader(f"Sites ({len(all_sites):,} loaded)")
+    if all_sites:
+        st.caption(
+            "Narrow the loaded list without re-fetching. "
+            "Include / exclude are comma-separated substrings "
+            "(e.g. `HYDRA` or `14211`). Search filters as you type. "
+            "Table, map, and site picker all use the same result."
+        )
+        col_inc, col_exc = st.columns(2)
+        with col_inc:
+            include_raw = st.text_input(
+                "Include (contains any)",
+                value="",
+                key=f"discovery_include_{source_key}",
+                help=(
+                    "Keep sites whose id/name contains any of these. "
+                    "Empty = keep all. Example: HYDRA"
+                ),
+            )
+        with col_exc:
+            exclude_raw = st.text_input(
+                "Exclude (contains any)",
+                value="",
+                key=f"discovery_exclude_{source_key}",
+                help=(
+                    "Drop sites matching any of these, after include. "
+                    "Example: HYDRA  or  Forecast"
+                ),
+            )
+        col_search, col_match = st.columns([2, 1])
+        with col_search:
+            search_raw = st.text_input(
+                "Search",
+                value="",
+                key=f"discovery_search_{source_key}",
+                help="Live contains-filter on top of include/exclude.",
+            )
+        with col_match:
+            match_on = st.selectbox(
+                "Match on",
+                options=["id_or_name", "id", "name"],
+                format_func=lambda v: {
+                    "id_or_name": "ID or name",
+                    "id": "Site ID",
+                    "name": "Name",
+                }[v],
+                key=f"discovery_match_{source_key}",
+            )
 
-    if sites_df.empty:
-        st.warning("No sites matched those filters.")
+        sites = filter_sites(
+            all_sites,
+            include=parse_patterns(include_raw),
+            exclude=parse_patterns(exclude_raw),
+            search=search_raw,
+            match_on=match_on,
+        )
+        filtered_df = sites_to_dataframe(sites)
+        st.caption(
+            f"Showing {len(sites):,} of {len(all_sites):,} "
+            "after include / exclude / search."
+        )
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    else:
+        sites = []
+        st.dataframe(sites_df, use_container_width=True, hide_index=True)
+
+    if not all_sites:
+        st.warning("No sites matched those Find-sites filters.")
+        return
+    if not sites:
+        st.warning(
+            "No sites left after include / exclude / search. "
+            "Clear or loosen those filters."
+        )
         return
 
-    # ---- map (Step 5a: pins only) ----
-    from gui.map_view import render_sites_map
-    render_sites_map(sites, source_key)
-
-    # ---- parameters for selected site(s) ----
-    st.subheader("Available parameters")
+    # ---- map + site selection (5a pins, 5b click-to-select) ----
     id_list = [s.site_id for s in sites]
-    # Default to first site so one click shows something useful
+    select_key = f"discovery_select_{source_key}"
+    sig_key = f"discovery_ids_sig_{source_key}"
+    # Signature is the *filtered* id list: include/exclude changes
+    # sanitize the multiselect; a brand-new Find sites list resets
+    # to the first visible site.
+    sites_sig = tuple(id_list)
+    full_sig_key = f"discovery_full_sig_{source_key}"
+    full_sig = tuple(s.site_id for s in all_sites)
+    if st.session_state.get(full_sig_key) != full_sig:
+        st.session_state[full_sig_key] = full_sig
+        st.session_state[sig_key] = sites_sig
+        st.session_state[select_key] = id_list[:1] if id_list else []
+    elif st.session_state.get(sig_key) != sites_sig:
+        st.session_state[sig_key] = sites_sig
+        # Keep selections that are still visible; if none left,
+        # fall back to the first filtered site.
+        kept = [
+            i for i in st.session_state.get(select_key, [])
+            if i in id_list
+        ]
+        st.session_state[select_key] = (
+            kept if kept else (id_list[:1] if id_list else [])
+        )
+    else:
+        current = [
+            i for i in st.session_state.get(select_key, [])
+            if i in id_list
+        ]
+        st.session_state[select_key] = current
+
+    # New map component key when the filtered set changes so
+    # streamlit-folium doesn't keep showing a stale pin set.
+    map_sig = hashlib.md5(
+        ",".join(id_list).encode("utf-8")
+    ).hexdigest()[:12]
+
+    from gui.map_view import render_sites_map
+    clicked_id = render_sites_map(
+        sites,
+        source_key,
+        known_ids=set(id_list),
+        map_key=f"sites_map_{source_key}_{map_sig}",
+    )
+    if clicked_id and clicked_id in id_list:
+        chosen = list(st.session_state.get(select_key, []))
+        if clicked_id not in chosen:
+            st.session_state[select_key] = chosen + [clicked_id]
+            st.toast(f"Added {clicked_id} from map")
+
+    st.subheader("Available parameters")
     selected = st.multiselect(
         "Sites to inspect",
         options=id_list,
-        default=id_list[:1],
-        key=f"discovery_select_{source_key}",
-        help="One row per real series/element/dataset at each site.",
+        key=select_key,
+        help=(
+            "Pick from the filtered list or click pins on the map. "
+            "One catalogue row per real series/element/dataset."
+        ),
     )
-
     load_params = st.button(
         "Show available parameters",
         key=f"params_{source_key}",
