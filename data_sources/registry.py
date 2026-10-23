@@ -17,12 +17,13 @@ Lazy factories on purpose:
     import is free; construction only happens when someone
     calls create_source().
 
-Options are Streamlit-agnostic:
-    Plain data describing sidebar widgets the GUI will build
-    later. No streamlit imports here -- this package stays
-    testable without the GUI installed. Step 2 wires these
-    into actual widgets; create_source() still uses each
-    class's own constructor defaults for now.
+    Options are Streamlit-agnostic:
+    Plain data describing sidebar widgets the GUI will build.
+    No streamlit imports here -- this package stays testable
+    without the GUI installed. Construction-related options
+    (e.g. verify_ssl) can be passed into create_source();
+    download-only options (e.g. duration) stay for the GUI
+    to use later and are ignored by the factory.
 """
 
 from dataclasses import dataclass
@@ -85,10 +86,11 @@ _SOURCES: Tuple[SourceDescriptor, ...] = (
             "USGS OGC API — streamflow, stage, and other "
             "continuous/daily series at monitoring locations."
         ),
-        factory=lambda: USGSDataSource(),
+        # **kwargs so create_source can pass options later;
+        # USGS doesn't take verify_ssl, so ignore extras.
+        factory=lambda **kwargs: USGSDataSource(),
         # Sidebar filters (state, bbox, shapefile) are shared
-        # discovery UI, not source-construction options -- I'll
-        # wire those in Step 2/3 rather than invent them here.
+        # discovery UI in the GUI, not construction options.
         options=(),
     ),
     SourceDescriptor(
@@ -98,7 +100,9 @@ _SOURCES: Tuple[SourceDescriptor, ...] = (
             "Portland Bureau of Environmental Services "
             "Aquarius portal — local precip and related datasets."
         ),
-        factory=lambda: AquariusDataSource(),
+        factory=lambda **kwargs: AquariusDataSource(
+            verify_ssl=kwargs.get("verify_ssl", False),
+        ),
         options=(
             SourceOption(
                 key="verify_ssl",
@@ -119,7 +123,9 @@ _SOURCES: Tuple[SourceDescriptor, ...] = (
             "NRCS AWDB REST — SNOTEL (and SCAN) snow, soil, "
             "and weather elements by station triplet."
         ),
-        factory=lambda: SNOTELDataSource(),
+        factory=lambda **kwargs: SNOTELDataSource(
+            verify_ssl=kwargs.get("verify_ssl", True),
+        ),
         options=(
             SourceOption(
                 key="verify_ssl",
@@ -175,11 +181,12 @@ def get_descriptor(key: str) -> SourceDescriptor:
         ) from None
 
 
-def create_source(key: str) -> BaseDataSource:
+def create_source(key: str, **kwargs) -> BaseDataSource:
     """Build a fresh source instance for the given key.
 
     Fresh every call on purpose -- the GUI (or caller) owns
-    caching, not the registry. Constructor defaults come from
-    each class; sidebar options aren't applied here yet.
+    caching, not the registry. Optional kwargs are forwarded
+    to the factory (verify_ssl for Aquarius/SNOTEL); each
+    factory only picks what its constructor understands.
     """
-    return get_descriptor(key).factory()
+    return get_descriptor(key).factory(**kwargs)

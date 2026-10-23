@@ -1,15 +1,14 @@
 """
-DataDownloader — Streamlit skeleton (Step 2).
+DataDownloader — Streamlit GUI.
 
 Run from the data-downloader folder:
     streamlit run gui\\app.py
 
-What this page does today:
-    - Lists sources from the registry (no hard-coded names)
-    - Lets me pick one; builds it via create_source() into
-      session_state (constructor only -- no get_sites / get_data)
-    - Renders that source's declared sidebar options
-    - Shows an empty main-page placeholder for Step 3
+Steps so far:
+    1. Registry-backed source picker
+    2. Source-specific sidebar options
+    3. Discovery: sites table + available-parameters table
+       (button-driven; no downloads yet)
 
 Install once (same conda env as the downloader):
     pip install -r requirements-gui.txt
@@ -28,21 +27,39 @@ if str(_ROOT) not in sys.path:
 import streamlit as st
 
 from data_sources import create_source, get_descriptor, list_sources
+from gui.discovery import clear_discovery_state, render_discovery
 from gui.widgets import render_source_options
 
 
-def _ensure_source(key: str) -> None:
-    """Build (or rebuild) the active source when the pick changes.
+def _constructor_kwargs(source_key: str, option_values: dict) -> dict:
+    """Pick option values that create_source actually understands.
+
+    duration stays GUI-only until downloads (Step 4).
+    """
+    kwargs = {}
+    if source_key in ("aquarius", "snotel") and "verify_ssl" in option_values:
+        kwargs["verify_ssl"] = bool(option_values["verify_ssl"])
+    return kwargs
+
+
+def _ensure_source(key: str, option_values: dict) -> None:
+    """Build (or rebuild) the active source when pick/options change.
 
     Streamlit reruns this whole script on every widget click, so
-    I stash the live source on st.session_state. Rebuilding only
-    when the key changes means I don't construct a new USGS /
-    SNOTEL client on every checkbox tick.
+    I stash the live source on st.session_state. Fingerprint
+    includes constructor kwargs (verify_ssl) so flipping SSL
+    rebuilds the client. Discovery results clear on rebuild --
+    they belong to the previous source.
     """
-    if st.session_state.get("source_key") == key:
+    kwargs = _constructor_kwargs(key, option_values)
+    fingerprint = (key, tuple(sorted(kwargs.items())))
+    if st.session_state.get("source_fingerprint") == fingerprint:
         return
+
+    st.session_state["source_fingerprint"] = fingerprint
     st.session_state["source_key"] = key
-    st.session_state["source"] = create_source(key)
+    st.session_state["source"] = create_source(key, **kwargs)
+    clear_discovery_state()
 
 
 def main() -> None:
@@ -67,27 +84,22 @@ def main() -> None:
         help="Catalog comes from data_sources.registry — not hard-coded here.",
     )
 
-    _ensure_source(selected_key)
     descriptor = get_descriptor(selected_key)
-    source = st.session_state["source"]
 
-    # Source-specific sidebar widgets (values collected for
-    # later steps; create_source still uses class defaults).
+    # Options first so verify_ssl can feed create_source.
     option_values = render_source_options(
         descriptor.options, source_key=selected_key
     )
     st.session_state["source_options"] = option_values
 
-    # ---- main page (empty on purpose for Step 2) ----
+    _ensure_source(selected_key, option_values)
+    source = st.session_state["source"]
+
     st.title(descriptor.display_name)
     st.write(descriptor.description)
 
-    st.info(
-        "Discovery (sites + available parameters) comes in Step 3. "
-        "This page is just the picker and sidebar wiring."
-    )
+    render_discovery(source, selected_key)
 
-    # Tiny status so I can see the factory actually ran.
     with st.expander("Session status (debug)", expanded=False):
         st.write(
             {
@@ -95,6 +107,9 @@ def main() -> None:
                 "source_class": type(source).__name__,
                 "source_name": source.source_name,
                 "option_values": option_values,
+                "sites_loaded": len(
+                    st.session_state.get("discovery_sites") or []
+                ),
             }
         )
 
