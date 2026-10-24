@@ -2,7 +2,8 @@ import os
 import pickle
 import sqlite3
 import pandas as pd
-from logging_setup import setup_logging, get_logger
+
+from .logging_setup import setup_logging, get_logger
 
 # Setup logging
 setup_logging()

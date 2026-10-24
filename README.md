@@ -91,13 +91,21 @@ Browser opens at `http://localhost:8501`. Sidebar pages:
 
 ```
 data-downloader/
-  app.py              # Toolkit home (streamlit run app.py)
-  pages/              # Data Download, StreamStats, …
-  data_sources/       # BaseDataSource + USGS / Aquarius / SNOTEL + registry
-  streamstats/        # StreamStats client (stub)
-  gui/                # Data Download Streamlit modules
-  tests/              # Live hammer_test.py
+  app.py                 # Toolkit home (streamlit run app.py)
+  pages/                 # Data Download, StreamStats, …
+  data_sources/          # BaseDataSource + USGS / Aquarius / SNOTEL + registry
+  streamstats/           # StreamStats client (stub)
+  gui/                   # Data Download Streamlit modules
+  analysis/              # Storm / gauge analysis (precip SQLite → storms)
+  tests/                 # Live hammer_test.py
   aquarius_data_downloader.py
-  storm*.py / gauge_analysis.py
+  config.py
   requirements-gui.txt
+```
+
+Storm / gauge scripts (from this folder):
+
+```powershell
+python -m analysis.regional_storm_analysis
+python -m analysis.gauge_analysis
 ```

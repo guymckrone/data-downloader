@@ -1,13 +1,28 @@
+"""Per-gauge missingness / co-observation analysis on precip SQLite DBs.
+
+Run from the repo root (``data-downloader/``):
+
+    python -m analysis.gauge_analysis
+"""
+
 from datetime import datetime
 import os
+import sys
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 
+# Project root must be on sys.path so ``config`` and ``analysis.*`` resolve
+# whether you use ``python -m analysis.…`` or ``python analysis/….py``.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Import shared configuration
 from config import OUTPUT_DIR, START_DATE, END_DATE
-from data_loader import find_latest_database, load_rainfall_data, filter_by_date
-from logging_setup import setup_logging, get_logger
+from analysis.data_loader import find_latest_database, load_rainfall_data, filter_by_date
+from analysis.logging_setup import setup_logging, get_logger
 
 # Set up logging
 setup_logging()

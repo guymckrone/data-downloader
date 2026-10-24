@@ -1,7 +1,23 @@
+"""Find regional storms in the latest precipitation SQLite DB.
+
+Run from the repo root (``data-downloader/``):
+
+    python -m analysis.regional_storm_analysis
+"""
+
+import sys
+from pathlib import Path
+
+# Project root must be on sys.path so ``config`` and ``analysis.*`` resolve
+# whether you use ``python -m analysis.…`` or ``python analysis/….py``.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from config import OUTPUT_DIR, START_DATE, END_DATE
-from logging_setup import setup_logging, get_logger
-from data_loader import find_latest_database, load_rainfall_data, filter_by_date
-from storm_catalog import StormCatalog
+from analysis.logging_setup import setup_logging, get_logger
+from analysis.data_loader import find_latest_database, load_rainfall_data, filter_by_date
+from analysis.storm_catalog import StormCatalog
 
 setup_logging()
 logger = get_logger(__name__)
