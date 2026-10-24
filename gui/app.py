@@ -1,10 +1,13 @@
 """
-DataDownloader — Streamlit GUI.
+Data Download tool — Streamlit page body for Tributary Toolkit.
 
-Run from the data-downloader folder:
-    streamlit run gui\\app.py
+Prefer launching the whole toolkit:
+    streamlit run app.py
+then open **Data Download** in the sidebar.
 
-Steps so far:
+(This module still works alone via pages/01_Data_Download.py.)
+
+Features:
     1. Registry-backed source picker
     2. Source-specific sidebar options
     3. Discovery: sites table + available-parameters table
@@ -13,9 +16,6 @@ Steps so far:
     5b. Click a map pin to add it to Sites to inspect
     5c. Draw a bbox on the map to find sites
     5d. Shapefile ZIP upload -> bbox site search
-
-Install once (same conda env as the downloader):
-    pip install -r requirements-gui.txt
 """
 
 import sys
@@ -70,7 +70,7 @@ def _ensure_source(key: str, option_values: dict) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="DataDownloader",
+        page_title="Data Download — Tributary Toolkit",
         layout="wide",
     )
 
@@ -82,7 +82,7 @@ def main() -> None:
     keys = [d.key for d in sources]
     label_for = {d.key: d.display_name for d in sources}
 
-    st.sidebar.title("DataDownloader")
+    st.sidebar.header("Data Download")
     selected_key = st.sidebar.radio(
         "Data source",
         options=keys,

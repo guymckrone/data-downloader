@@ -1,13 +1,12 @@
-# DataDownloader
+# Tributary Toolkit
 
-Environmental data downloader for ecological restoration work. Pull sites
-and time series from **USGS Water Data**, **Portland BES Aquarius**, and
-**NRCS SNOTEL** through one interface — or use the Streamlit GUI to
-discover sites on a map and export CSV / SQLite.
+Stream restoration toolkit. Today that means a **Data Download** tool
+(USGS, Portland BES Aquarius, NRCS SNOTEL) plus a **StreamStats**
+shell for the next watershed-batch feature.
 
 ## Requirements
 
-- Windows + PowerShell (use `;` between commands, not `&&`)
+- Windows + PowerShell / cmd (use `;` between commands in PowerShell, not `&&`)
 - Python / conda env with `requests`, `pandas`, `python-dotenv`
 - A `.env` file in this folder (never commit it):
 
@@ -40,7 +39,7 @@ sites = usgs.get_sites(state="OR", site_ids=["14211400"])
 params = usgs.available_parameters_dataframe(["14211400"])
 ```
 
-## Streamlit GUI
+## Streamlit GUI (toolkit hub)
 
 Install GUI extras into the **same** env you use to run Streamlit
 (if Aquarius fails with `No module named 'dotenv'`, you're probably on
@@ -49,14 +48,20 @@ base miniforge — install the requirements there or activate your project env):
 ```powershell
 cd data-downloader
 pip install -r requirements-gui.txt
-streamlit run gui\app.py
+streamlit run app.py
 ```
 
-Browser opens at `http://localhost:8501`.
+Browser opens at `http://localhost:8501`. Sidebar pages:
 
-### Typical workflow
+| Page | Status |
+|---|---|
+| **Home** (`app.py`) | Toolkit overview |
+| **Data Download** | Full gage/time-series GUI |
+| **StreamStats** | Stub — API wiring next |
 
-1. Pick a source in the sidebar (USGS / Aquarius / SNOTEL).
+### Data Download workflow
+
+1. Open **Data Download**; pick a source in the sidebar (USGS / Aquarius / SNOTEL).
 2. **Find sites** — state / site IDs / USGS agency+type, **or**
    draw a box, **or** upload a shapefile ZIP.
 3. Narrow with **Include / Exclude / Search** (no extra API calls).
@@ -86,11 +91,13 @@ Browser opens at `http://localhost:8501`.
 
 ```
 data-downloader/
-  data_sources/     # BaseDataSource + USGS / Aquarius / SNOTEL + registry
-  gui/              # Streamlit app
-  tests/            # Live hammer_test.py
-  aquarius_data_downloader.py   # Original precip→SQLite client
-  storm*.py / gauge_analysis.py # Downstream rainfall analysis
-  HANDOFF.md
+  app.py              # Toolkit home (streamlit run app.py)
+  pages/              # Data Download, StreamStats, …
+  data_sources/       # BaseDataSource + USGS / Aquarius / SNOTEL + registry
+  streamstats/        # StreamStats client (stub)
+  gui/                # Data Download Streamlit modules
+  tests/              # Live hammer_test.py
+  aquarius_data_downloader.py
+  storm*.py / gauge_analysis.py
   requirements-gui.txt
 ```
