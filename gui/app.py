@@ -12,6 +12,7 @@ Steps so far:
     5a. Map pins for discovered sites (folium, clustered)
     5b. Click a map pin to add it to Sites to inspect
     5c. Draw a bbox on the map to find sites
+    5d. Shapefile ZIP upload -> bbox site search
 
 Install once (same conda env as the downloader):
     pip install -r requirements-gui.txt

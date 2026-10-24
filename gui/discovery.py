@@ -9,6 +9,7 @@ extra API calls. Same filters work for every source.
 """
 
 import hashlib
+import zipfile
 from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -155,8 +156,10 @@ def clear_discovery_state() -> None:
             or key.startswith("sites_map_")
             or key.startswith("bbox_draw_map_")
             or key.startswith("drawn_bbox_")
+            or key.startswith("shp_upload_")
         ):
             st.session_state.pop(key, None)
+    st.session_state.pop("discovery_shp_note", None)
     # Local import avoids a circular import at module load
     # (download.py doesn't import discovery today, but I don't
     # want a future one to bite me).
@@ -355,6 +358,74 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
                     bbox=bbox,
                 )
 
+    # ---- 5d: shapefile zip -> bbox -> get_sites ----
+    with st.expander("Find from shapefile ZIP", expanded=False):
+        st.caption(
+            "Upload a zip of a shapefile (.shp + .shx/.dbf/.prj). "
+            "I use the file's bounding box, not the exact polygon, "
+            "so corner sites can be included. Must be lon/lat "
+            "(WGS84) — projected files are rejected. USGS agency / "
+            "site-type filters above still apply. SNOTEL still "
+            "needs a State."
+        )
+        upload = st.file_uploader(
+            "Shapefile ZIP",
+            type=["zip"],
+            key=f"shp_upload_{source_key}",
+        )
+        find_shp = st.button(
+            "Find sites in shapefile bbox",
+            key=f"find_shp_{source_key}",
+        )
+        if find_shp:
+            if upload is None:
+                st.session_state["discovery_error"] = (
+                    "Choose a .zip shapefile first."
+                )
+            elif source_key == "snotel" and not state_arg:
+                st.session_state["discovery_error"] = (
+                    "SNOTEL shapefile search still needs a State "
+                    "above (e.g. OR)."
+                )
+            else:
+                from gui.shapefile_upload import bbox_from_shapefile_zip
+                try:
+                    shp_bbox, shp_name = bbox_from_shapefile_zip(
+                        upload.getvalue()
+                    )
+                except (ValueError, FileNotFoundError, zipfile.BadZipFile) as exc:
+                    st.session_state["discovery_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception as exc:
+                    st.session_state["discovery_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    min_lon, min_lat, max_lon, max_lat = shp_bbox
+                    st.session_state["discovery_shp_note"] = (
+                        f"{shp_name}: lon {min_lon:.4f}…{max_lon:.4f}, "
+                        f"lat {min_lat:.4f}…{max_lat:.4f}"
+                    )
+                    # Don't also clip by the State box for USGS /
+                    # Aquarius -- the shapefile bbox is the area.
+                    # SNOTEL still needs state so the station pull
+                    # stays bounded before the bbox filter.
+                    shp_state = state_arg if source_key == "snotel" else None
+                    _run_get_sites(
+                        source,
+                        source_key,
+                        state=shp_state,
+                        site_ids=None,
+                        agency_code=agency_code,
+                        site_type_code=site_type_code,
+                        bbox=shp_bbox,
+                    )
+
+        shp_note = st.session_state.get("discovery_shp_note")
+        if shp_note:
+            st.caption(f"Last shapefile bbox — {shp_note}")
+
     err = st.session_state.get("discovery_error")
     if err:
         st.error(err)
@@ -364,8 +435,8 @@ def render_discovery(source: BaseDataSource, source_key: str) -> None:
 
     if sites_df is None:
         st.info(
-            "Click **Find sites** (filters above) or "
-            "**Find sites in box** (draw a rectangle) to load a table."
+            "Click **Find sites**, **Find sites in box**, or "
+            "**Find sites in shapefile bbox** to load a table."
         )
         return
 
