@@ -1,5 +1,3 @@
-# Create a Python .gitignore file
-cat > .gitignore << EOF
 # Python
 __pycache__/
 *.py[cod]
@@ -8,7 +6,12 @@ __pycache__/
 .Python
 env/
 venv/
+
+# Secrets / local env
 .env
+
+# Local project notes (not for the remote)
+HANDOFF.md
 
 # IDEs
 .vscode/
@@ -19,4 +22,3 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-EOF
